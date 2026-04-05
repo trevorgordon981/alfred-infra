@@ -1,0 +1,336 @@
+{
+  "timestamp": "2026-03-29T17:36:25.072994",
+  "config": {
+    "api_url": "http://127.0.0.1:8090/v1",
+    "iterations": 3,
+    "output_tokens": 512,
+    "context_sizes": [
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      98304,
+      131072
+    ]
+  },
+  "summary": {
+    "4K": {
+      "context_size": 4096,
+      "avg_ttft_s": 18.57,
+      "avg_tps": 10711.03,
+      "avg_total_s": 18.59,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "8K": {
+      "context_size": 8192,
+      "avg_ttft_s": 22.39,
+      "avg_tps": 11389.43,
+      "avg_total_s": 22.41,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "16K": {
+      "context_size": 16384,
+      "avg_ttft_s": 31.55,
+      "avg_tps": 13294.99,
+      "avg_total_s": 31.57,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "32K": {
+      "context_size": 32768,
+      "avg_ttft_s": 53.54,
+      "avg_tps": 11549.72,
+      "avg_total_s": 53.56,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "64K": {
+      "context_size": 65536,
+      "avg_ttft_s": 105.48,
+      "avg_tps": 12226.0,
+      "avg_total_s": 105.51,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "96K": {
+      "context_size": 98304,
+      "avg_ttft_s": 170.88,
+      "avg_tps": 11491.66,
+      "avg_total_s": 170.9,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    },
+    "128K": {
+      "context_size": 131072,
+      "avg_ttft_s": 250.4,
+      "avg_tps": 12002.8,
+      "avg_total_s": 250.42,
+      "avg_pageouts": 0.0,
+      "failures": 0,
+      "runs": 3
+    }
+  },
+  "raw": [
+    {
+      "ttft_s": 21.81,
+      "total_s": 21.84,
+      "output_tokens": 290,
+      "tokens_per_sec": 10606.76,
+      "decode_time_s": 0.03,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 95,
+      "mem_free_pct_after": 36,
+      "context_size": 4096,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 16.27,
+      "total_s": 16.29,
+      "output_tokens": 250,
+      "tokens_per_sec": 11612.9,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 4096,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 17.62,
+      "total_s": 17.64,
+      "output_tokens": 279,
+      "tokens_per_sec": 9913.44,
+      "decode_time_s": 0.03,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 4096,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 22.74,
+      "total_s": 22.76,
+      "output_tokens": 285,
+      "tokens_per_sec": 13330.29,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 8192,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 22.57,
+      "total_s": 22.59,
+      "output_tokens": 280,
+      "tokens_per_sec": 11556.24,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 8192,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 21.87,
+      "total_s": 21.89,
+      "output_tokens": 257,
+      "tokens_per_sec": 9281.75,
+      "decode_time_s": 0.03,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 8192,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 31.86,
+      "total_s": 31.88,
+      "output_tokens": 266,
+      "tokens_per_sec": 15186.95,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 16384,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 31.34,
+      "total_s": 31.36,
+      "output_tokens": 249,
+      "tokens_per_sec": 13255.05,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 16384,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 31.45,
+      "total_s": 31.47,
+      "output_tokens": 254,
+      "tokens_per_sec": 11442.97,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 16384,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 53.36,
+      "total_s": 53.38,
+      "output_tokens": 246,
+      "tokens_per_sec": 12408.97,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 32768,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 54.31,
+      "total_s": 54.33,
+      "output_tokens": 271,
+      "tokens_per_sec": 11115.99,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 32768,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 52.95,
+      "total_s": 52.98,
+      "output_tokens": 243,
+      "tokens_per_sec": 11124.19,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 32768,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 105.2,
+      "total_s": 105.22,
+      "output_tokens": 245,
+      "tokens_per_sec": 13534.17,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 65536,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 105.85,
+      "total_s": 105.87,
+      "output_tokens": 260,
+      "tokens_per_sec": 12371.65,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 65536,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 105.4,
+      "total_s": 105.43,
+      "output_tokens": 252,
+      "tokens_per_sec": 10772.17,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 65536,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 171.18,
+      "total_s": 171.2,
+      "output_tokens": 259,
+      "tokens_per_sec": 12044.57,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 98304,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 171.19,
+      "total_s": 171.21,
+      "output_tokens": 258,
+      "tokens_per_sec": 10585.27,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 98304,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 170.27,
+      "total_s": 170.29,
+      "output_tokens": 240,
+      "tokens_per_sec": 11845.15,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 98304,
+      "iteration": 3
+    },
+    {
+      "ttft_s": 251.01,
+      "total_s": 251.03,
+      "output_tokens": 254,
+      "tokens_per_sec": 11785.59,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 131072,
+      "iteration": 1
+    },
+    {
+      "ttft_s": 250.49,
+      "total_s": 250.51,
+      "output_tokens": 242,
+      "tokens_per_sec": 12976.36,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 131072,
+      "iteration": 2
+    },
+    {
+      "ttft_s": 249.69,
+      "total_s": 249.71,
+      "output_tokens": 232,
+      "tokens_per_sec": 11246.46,
+      "decode_time_s": 0.02,
+      "pageouts_delta": 0,
+      "mem_free_pct_before": 36,
+      "mem_free_pct_after": 36,
+      "context_size": 131072,
+      "iteration": 3
+    }
+  ]
+}

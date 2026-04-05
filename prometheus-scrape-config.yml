@@ -1,0 +1,36 @@
+# Add these scrape configs to your Prometheus config on the Mac Studio
+# under the existing scrape_configs: section.
+#
+# Replace the placeholder IPs with your Tailscale IPs before use:
+#   <SPARK_A_IP>  — Tailscale IP of Spark A (RAG node)
+#   <SPARK_B_IP>  — Tailscale IP of Spark B (Voice node)
+
+  # --- System Metrics: Node Exporter ---
+  - job_name: 'node_exporter'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9100']
+        labels:
+          machine: 'mac-studio'
+          role: 'inference'
+      - targets: ['<SPARK_A_IP>:9100']
+        labels:
+          machine: 'spark-a'
+          role: 'rag'
+      - targets: ['<SPARK_B_IP>:9100']
+        labels:
+          machine: 'spark-b'
+          role: 'voice'
+
+  # --- GPU Metrics: DCGM Exporter (Sparks only) ---
+  - job_name: 'dcgm_gpu'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['<SPARK_A_IP>:9400']
+        labels:
+          machine: 'spark-a'
+          role: 'rag'
+      - targets: ['<SPARK_B_IP>:9400']
+        labels:
+          machine: 'spark-b'
+          role: 'voice'

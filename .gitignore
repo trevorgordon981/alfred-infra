@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Backup output / local state
+alfred-backups/
+staging/
+*.log
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Secrets / local env
+.env
+.env.*
+*.key
+*.pem

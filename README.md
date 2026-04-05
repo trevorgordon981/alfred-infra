@@ -115,6 +115,15 @@ reference second, so expect opinionated defaults. If you adapt it for a
 different topology (more nodes, different roles, no Tailscale), a PR with
 those variants would be appreciated.
 
+## Related projects
+
+Part of a self-hosted LLM operations toolkit:
+
+- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — tool-call-translating proxy for local LLM serving (monitored by this kit)
+- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — OTel metrics proxy whose Prometheus output this kit's dashboards visualize
+- [context-bench](https://github.com/trevorgordon981/context-bench) — context-window benchmark used from this kit to characterize new model deployments
+- [alfred-rag](https://github.com/trevorgordon981/alfred-rag) — hybrid RAG stack (example workload running on this infrastructure)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

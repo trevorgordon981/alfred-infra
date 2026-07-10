@@ -130,7 +130,8 @@ validate_origin
 chmod -R go-rwx "$R/.git"
 
 mkdir -p "$R/hermes" "$R/exitmgr-app" "$R/gordon-gauntlet" \
-    "$R/serving" "$R/launch-agents" "$R/longcall-manager"
+    "$R/serving" "$R/launch-agents" "$R/longcall-manager" \
+    "$R/pipeline-lifecycle"
 rsync -a --delete "${EX[@]}" "$HOME/.hermes/skills" "$R/hermes/"
 rsync -a "${EX[@]}" "$HOME/.hermes/SOUL.md" "$HOME/.hermes/config.yaml" "$R/hermes/"
 rsync -a --delete "${EX[@]}" "$HOME/exitmgr-app/exitmgr" "$HOME/exitmgr-app/tests" "$R/exitmgr-app/"
@@ -139,7 +140,20 @@ rsync -a "${EX[@]}" "$HOME"/exitmgr-app/*.py "$HOME/exitmgr-app/config.yaml" \
     "$HOME/exitmgr-app/README.md" "$R/exitmgr-app/"
 rsync -a "${EX[@]}" "$HOME/m3_serve.py" "$R/"
 rsync -a "${EX[@]}" "$HOME/m3_serve_batched.py" "$HOME/m3_batch_core.py" \
-    "$HOME/m3_lan_proxy.py" "$R/serving/"
+    "$HOME/m3_lan_proxy.py" "$HOME/machine_resource_lease.py" "$R/serving/"
+rsync -a "${EX[@]}" \
+    "$HOME/pipeline-automation/build_gate_promote_abliterated_m3.sh" \
+    "$HOME/pipeline-automation/eval_and_score.sh" \
+    "$HOME/pipeline-automation/evaluate_m3_supervised.sh" \
+    "$HOME/pipeline-automation/fuse_promote_m3.sh" \
+    "$HOME/pipeline-automation/launch_bound_training.sh" \
+    "$HOME/pipeline-automation/lib_pipeline.sh" \
+    "$HOME/pipeline-automation/m3v2_done_watch.sh" \
+    "$HOME/pipeline-automation/machine_resource_lease.py" \
+    "$HOME/pipeline-automation/onready_v1.sh" \
+    "$HOME/pipeline-automation/prepare_next_corpus.py" \
+    "$HOME/pipeline-automation/training_run_controller.py" \
+    "$R/pipeline-lifecycle/"
 rsync -a "${EX[@]}" \
     "$HOME/Library/LaunchAgents/ai.alfred.m3-prod.plist" \
     "$HOME/Library/LaunchAgents/ai.alfred.m3-lan-proxy.plist" \

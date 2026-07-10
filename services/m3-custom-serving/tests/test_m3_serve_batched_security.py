@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -86,6 +87,10 @@ class ContentLengthTests(unittest.TestCase):
 class PriorityTests(unittest.TestCase):
     TOKEN = "priority-owner-token-0123456789abcdef"
 
+    @staticmethod
+    def _enqueue(priority):
+        return SERVER._enqueue([], 1, 0.0, False, None, priority=priority)
+
     def test_default_and_unparseable_priority_are_one(self):
         self.assertEqual(1, SERVER._request_priority(headers()))
         self.assertEqual(1, SERVER._request_priority(headers(("X-M3-Priority", "urgent"))))
@@ -123,6 +128,56 @@ class PriorityTests(unittest.TestCase):
                     ("X-M3-Priority-Token", self.TOKEN),
                 )
                 self.assertEqual(1, SERVER._request_priority(hdrs))
+
+    def test_default_backlog_cannot_consume_reserved_urgent_capacity(self):
+        pending = SERVER._queue.PriorityQueue(maxsize=3)
+        slots = threading.BoundedSemaphore(3)
+        with mock.patch.object(SERVER, "JOBQ", pending), \
+                mock.patch.object(SERVER, "_QUEUE_SLOTS", slots), \
+                mock.patch.object(SERVER, "MAX_PENDING", 2), \
+                mock.patch.object(SERVER, "PRIORITY0_RESERVED", 1), \
+                mock.patch.object(SERVER, "MAX_TOTAL_PENDING", 3):
+            self._enqueue(1)
+            self._enqueue(1)
+            with self.assertRaises(SERVER.Busy):
+                self._enqueue(1)
+            self._enqueue(0)
+            self.assertEqual(3, pending.qsize())
+            with self.assertRaises(SERVER.Busy):
+                self._enqueue(0)
+
+    def test_concurrent_urgent_overload_never_exceeds_hard_cap(self):
+        pending = SERVER._queue.PriorityQueue(maxsize=4)
+        slots = threading.BoundedSemaphore(4)
+        barrier = threading.Barrier(16)
+        accepted = []
+        rejected = []
+        outcome_lock = threading.Lock()
+
+        def submit():
+            barrier.wait()
+            try:
+                self._enqueue(0)
+                outcome = accepted
+            except SERVER.Busy:
+                outcome = rejected
+            with outcome_lock:
+                outcome.append(1)
+
+        with mock.patch.object(SERVER, "JOBQ", pending), \
+                mock.patch.object(SERVER, "_QUEUE_SLOTS", slots), \
+                mock.patch.object(SERVER, "MAX_PENDING", 2), \
+                mock.patch.object(SERVER, "PRIORITY0_RESERVED", 2), \
+                mock.patch.object(SERVER, "MAX_TOTAL_PENDING", 4):
+            threads = [threading.Thread(target=submit) for _ in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(4, len(accepted))
+            self.assertEqual(12, len(rejected))
+            self.assertEqual(4, pending.qsize())
 
 
 class SaveToTests(unittest.TestCase):
@@ -240,43 +295,121 @@ class RouteTests(unittest.TestCase):
 
 
 class RuntimePackageTreeTests(unittest.TestCase):
-    def _package(self, root):
-        package_root = Path(root) / "mlx_vlm"
-        package_root.mkdir()
-        package_file = package_root / "__init__.py"
-        package_file.write_text("VERSION = 1\n", encoding="utf-8")
-        (package_root / "model.py").write_text("MODEL = 'one'\n", encoding="utf-8")
-        return package_root, SimpleNamespace(__file__=str(package_file))
+    PACKAGES = ("mlx", "mlx_lm", "mlx_vlm")
 
-    def test_package_tree_fingerprint_is_content_bound_and_ignores_caches(self):
-        with tempfile.TemporaryDirectory() as td:
-            package_root, package = self._package(td)
-            with mock.patch.dict(sys.modules, {"mlx_vlm": package}):
-                first = SERVER._runtime_package_tree_sha256()
-                self.assertRegex(first, r"^[0-9a-f]{64}$")
+    def _packages(self, root):
+        roots = {}
+        modules = {}
+        for package_name in self.PACKAGES:
+            package_root = Path(root) / package_name
+            package_root.mkdir()
+            package_file = package_root / "__init__.py"
+            package_file.write_text("PACKAGE = %r\n" % package_name, encoding="utf-8")
+            (package_root / "model.py").write_text(
+                "MODEL = %r\n" % package_name, encoding="utf-8")
+            (package_root / "native.dylib").write_bytes(
+                ("native-" + package_name).encode("ascii"))
+            roots[package_name] = package_root
+            modules[package_name] = SimpleNamespace(__file__=str(package_file))
+        return roots, modules
 
-                cache = package_root / "__pycache__"
+    def _digests(self):
+        return {name: SERVER._runtime_package_tree_sha256(name)
+                for name in self.PACKAGES}
+
+    def test_all_package_fingerprints_bind_source_and_native_artifacts(self):
+        tamper_cases = (("mlx", "native.dylib", b"changed-native"),
+                        ("mlx_lm", "model.py", b"MODEL = 'changed'\n"),
+                        ("mlx_vlm", "native.dylib", b"changed-vlm-native"))
+        for changed_name, relative_path, replacement in tamper_cases:
+            with self.subTest(package=changed_name, path=relative_path), \
+                    tempfile.TemporaryDirectory(dir=HERE) as td:
+                roots, modules = self._packages(td)
+                with mock.patch.dict(sys.modules, modules):
+                    before = self._digests()
+                    self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", item)
+                                        for item in before.values()))
+                    (roots[changed_name] / relative_path).write_bytes(replacement)
+                    after = self._digests()
+                self.assertNotEqual(before[changed_name], after[changed_name])
+                for stable_name in set(self.PACKAGES) - {changed_name}:
+                    self.assertEqual(before[stable_name], after[stable_name])
+
+    def test_package_tree_binds_bytecode_cache(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            roots, modules = self._packages(td)
+            with mock.patch.dict(sys.modules, modules):
+                first = SERVER._runtime_package_tree_sha256("mlx_vlm")
+                cache = roots["mlx_vlm"] / "__pycache__"
                 cache.mkdir()
                 (cache / "ignored.pyc").write_bytes(b"cache")
-                self.assertEqual(first, SERVER._runtime_package_tree_sha256())
+                self.assertNotEqual(first, SERVER._runtime_package_tree_sha256("mlx_vlm"))
 
-                (package_root / "model.py").write_text("MODEL = 'two'\n", encoding="utf-8")
-                self.assertNotEqual(first, SERVER._runtime_package_tree_sha256())
+    def test_package_tree_traversal_error_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            _roots, modules = self._packages(td)
 
-    def test_package_tree_rejects_symlink_files_and_directories(self):
-        for kind in ("file", "directory"):
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
-                package_root, package = self._package(td)
-                target = Path(td) / ("target.py" if kind == "file" else "target-dir")
-                if kind == "file":
-                    target.write_text("outside = True\n", encoding="utf-8")
-                    (package_root / "linked.py").symlink_to(target)
-                else:
-                    target.mkdir()
-                    (package_root / "linked-dir").symlink_to(target, target_is_directory=True)
-                with mock.patch.dict(sys.modules, {"mlx_vlm": package}), \
-                        self.assertRaises(SERVER.StartupIdentityError):
-                    SERVER._runtime_package_tree_sha256()
+            def denied_walk(_root, *, topdown, followlinks, onerror):
+                self.assertTrue(topdown)
+                self.assertFalse(followlinks)
+                onerror(PermissionError("unreadable native subtree"))
+                yield from ()
+
+            with mock.patch.dict(sys.modules, modules), \
+                    mock.patch.object(SERVER.os, "walk", new=denied_walk), \
+                    self.assertRaises(SERVER.StartupIdentityError):
+                SERVER._runtime_package_tree_sha256("mlx")
+
+    def test_loaded_runtime_must_equal_preimport_snapshot(self):
+        trees = {"mlx": "1" * 64, "mlx_lm": "2" * 64,
+                 "mlx_vlm": "3" * 64}
+        batch = {"path": "/tmp/m3_batch_core.py", "sha256": "4" * 64}
+        loaded = SimpleNamespace(__file__=batch["path"])
+        with mock.patch.dict(sys.modules, {"m3_batch_core": loaded}), \
+                mock.patch.object(SERVER, "_runtime_package_tree_sha256",
+                                  side_effect=lambda name: trees[name]), \
+                mock.patch.object(SERVER, "_runtime_file_identity", return_value=batch), \
+                mock.patch.object(SERVER, "_PREIMPORT_PACKAGE_TREES", dict(trees)), \
+                mock.patch.object(SERVER, "_PREIMPORT_BATCH_CORE_IDENTITY", dict(batch)):
+            self.assertEqual((trees, batch), SERVER._verified_runtime_code_identity())
+        changed = dict(trees, mlx="9" * 64)
+        with mock.patch.dict(sys.modules, {"m3_batch_core": loaded}), \
+                mock.patch.object(SERVER, "_runtime_package_tree_sha256",
+                                  side_effect=lambda name: trees[name]), \
+                mock.patch.object(SERVER, "_runtime_file_identity", return_value=batch), \
+                mock.patch.object(SERVER, "_PREIMPORT_PACKAGE_TREES", changed), \
+                mock.patch.object(SERVER, "_PREIMPORT_BATCH_CORE_IDENTITY", dict(batch)), \
+                self.assertRaises(SERVER.StartupIdentityError):
+            SERVER._verified_runtime_code_identity()
+
+    def test_each_package_rejects_symlink_files_and_directories(self):
+        for package_name in self.PACKAGES:
+            for kind in ("file", "directory"):
+                with self.subTest(package=package_name, kind=kind), \
+                        tempfile.TemporaryDirectory(dir=HERE) as td:
+                    roots, modules = self._packages(td)
+                    target = Path(td) / ("target.py" if kind == "file" else "target-dir")
+                    if kind == "file":
+                        target.write_text("outside = True\n", encoding="utf-8")
+                        (roots[package_name] / "linked.py").symlink_to(target)
+                    else:
+                        target.mkdir()
+                        (roots[package_name] / "linked-dir").symlink_to(
+                            target, target_is_directory=True)
+                    with mock.patch.dict(sys.modules, modules), \
+                            self.assertRaises(SERVER.StartupIdentityError):
+                        SERVER._runtime_package_tree_sha256(package_name)
+
+    def test_package_root_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            roots, modules = self._packages(td)
+            package_root = roots["mlx"]
+            real_root = Path(td) / "real-mlx"
+            package_root.rename(real_root)
+            package_root.symlink_to(real_root, target_is_directory=True)
+            with mock.patch.dict(sys.modules, modules), \
+                    self.assertRaises(SERVER.StartupIdentityError):
+                SERVER._runtime_package_tree_sha256("mlx")
 
 
 class StartupIdentityTests(unittest.TestCase):
@@ -351,24 +484,28 @@ class StartupIdentityTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(raw).hexdigest(),
                              identity["artifact_manifest_sha256"])
 
-    def test_direction_artifact_schema_is_supported_but_strict(self):
+    def test_direction_artifact_schemas_are_supported_but_strict(self):
         with tempfile.TemporaryDirectory(dir=HERE) as td:
             model = Path(td) / "model"; model.mkdir()
-            value = {
-                "schema": 4, "kind": "pipeline-artifact",
-                "artifact_type": "m3-abliteration-build",
-                "artifact_id": "0123456789abcdef0123456789abcdef",
-                "created_unix": 1, "label": "M3", "version": "abl-v1",
-                "candidate": {"path": str(model)}, "base": {},
-                "direction_bundle": {}, "recipe": {}, "direction_binding": {},
-                "evidence": [], "metadata": {},
+            base = {
+                "kind": "pipeline-artifact", "artifact_type": "m3-abliteration-build",
+                "artifact_id": "0123456789abcdef0123456789abcdef", "created_unix": 1,
+                "label": "M3", "version": "abl-v1", "candidate": {"path": str(model)},
+                "base": {}, "direction_bundle": {}, "recipe": {},
+                "direction_binding": {}, "evidence": [], "metadata": {},
             }
-            manifest, raw = self._manifest(td, model, value)
-            identity = SERVER._build_startup_identity(
-                str(model), str(manifest), pid=123, started_unix=456,
-                startup_nonce="0123456789abcdef0123456789abcdef")
-            self.assertEqual(hashlib.sha256(raw).hexdigest(),
-                             identity["artifact_manifest_sha256"])
+            for schema in (4, 5):
+                with self.subTest(schema=schema):
+                    value = dict(base, schema=schema)
+                    if schema == 5:
+                        value["input_binding"] = {}
+                    manifest, raw = self._manifest(td, model, value)
+                    identity = SERVER._build_startup_identity(
+                        str(model), str(manifest), pid=123, started_unix=456,
+                        startup_nonce="0123456789abcdef0123456789abcdef")
+                    self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                                     identity["artifact_manifest_sha256"])
+            value = dict(base, schema=5, input_binding={})
             value["artifact_type"] = "model-build"
             manifest.write_bytes((json.dumps(
                 value, sort_keys=True, separators=(",", ":")) + "\n").encode())
@@ -395,11 +532,28 @@ class StartupIdentityTests(unittest.TestCase):
             old = SERVER.SERVER_IDENTITY
             old_runtime_out = SERVER._RUNTIME_RECEIPT_OUT
             old_loaded = (SERVER.MODEL, SERVER.PROC, SERVER.CFG)
+            runtime_digests = {"mlx": "1" * 64, "mlx_lm": "2" * 64,
+                               "mlx_vlm": "3" * 64}
+            batch_identity = {"path": str(HERE / "m3_batch_core.py"),
+                              "sha256": "4" * 64}
             try:
                 SERVER.SERVER_IDENTITY = identity
                 SERVER._RUNTIME_RECEIPT_OUT = None
                 SERVER.MODEL, SERVER.PROC, SERVER.CFG = object(), object(), object()
-                with mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
+                with mock.patch.object(
+                        SERVER, "_runtime_package_tree_sha256",
+                        side_effect=lambda package: runtime_digests[package]), \
+                        mock.patch.object(SERVER, "_runtime_file_identity",
+                                          side_effect=lambda _path, label: batch_identity
+                                          if label == "m3_batch_core"
+                                          else {"sha256": "5" * 64}), \
+                        mock.patch.object(SERVER, "_PREIMPORT_PACKAGE_TREES",
+                                          dict(runtime_digests)), \
+                        mock.patch.object(SERVER, "_PREIMPORT_BATCH_CORE_IDENTITY",
+                                          dict(batch_identity)), \
+                        mock.patch.dict(sys.modules, {"m3_batch_core": SimpleNamespace(
+                            __file__=batch_identity["path"])}), \
+                        mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
                         mock.patch.dict(os.environ,
                                         {"M3_RUNTIME_RECEIPT_DIR": str(runtime)}, clear=False):
                     SERVER._initialize_runtime_identity()
@@ -411,6 +565,16 @@ class StartupIdentityTests(unittest.TestCase):
                                  hashlib.sha256(receipts[0].read_bytes()).hexdigest())
                 receipt = json.loads(receipts[0].read_text())
                 self.assertEqual(receipt, identity["runtime_receipt"])
+                self.assertEqual(runtime_digests["mlx"],
+                                 receipt["contract"]["mlx_tree_sha256"])
+                self.assertEqual(runtime_digests["mlx_lm"],
+                                 receipt["contract"]["mlx_lm_tree_sha256"])
+                self.assertEqual(runtime_digests["mlx_vlm"],
+                                 receipt["contract"]["mlx_vlm_tree_sha256"])
+                self.assertEqual(SERVER.MAX_TOTAL_PENDING,
+                                 receipt["contract"]["max_total_pending"])
+                self.assertEqual(SERVER.PRIORITY0_RESERVED,
+                                 receipt["contract"]["priority0_reserved"])
                 contract_raw = (json.dumps(receipt["contract"], sort_keys=True,
                                            separators=(",", ":"), ensure_ascii=True,
                                            allow_nan=False) + "\n").encode("ascii")

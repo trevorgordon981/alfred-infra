@@ -8,22 +8,213 @@
 GET / -> "ready"; GET /v1/models -> OpenAI model list (health/up-checks).
 Thinking defaults OFF (mandatory-thinking is what stalled M2.7 on the breakout brief); opt in per-request
 via a leading "think:" on the last user message, or an explicit {"thinking":"enabled"} field."""
-import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math, hashlib  # [auditfix] +sys/traceback (#5), +random (#10)
+import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math, hashlib, importlib.util  # [auditfix] +sys/traceback (#5), +random (#10)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class StartupIdentityError(RuntimeError):
+    """The configured model/runtime cannot be bound to its provenance receipt."""
+
+
+def _runtime_stat(info):
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+            stat.S_IMODE(info.st_mode), info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns)
+
+
+def _runtime_package_tree_from_file(package_name, module_file):
+    """Fingerprint a package tree without importing it.
+
+    Bytecode is included, directory traversal errors are fatal, and inode/ctime
+    metadata makes a mutate-read-restore attack visible to the post-load check.
+    """
+    if not isinstance(package_name, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", package_name):
+        raise StartupIdentityError("runtime package name is invalid")
+    if not isinstance(module_file, str) or not module_file \
+            or not os.path.isabs(module_file):
+        raise StartupIdentityError("%s package has no absolute origin" % package_name)
+    module_file = os.path.normpath(module_file)
+    root = os.path.dirname(module_file)
+    if os.path.realpath(module_file) != module_file or os.path.islink(module_file) \
+            or os.path.realpath(root) != root or os.path.islink(root):
+        raise StartupIdentityError("%s package path must not traverse a symlink" % package_name)
+    try:
+        root_info = os.lstat(root)
+    except OSError as exc:
+        raise StartupIdentityError("cannot stat %s package root" % package_name) from exc
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise StartupIdentityError("%s package root is not a directory" % package_name)
+
+    directories = []
+    files = []
+
+    def walk_error(exc):
+        raise StartupIdentityError(
+            "cannot traverse %s package tree" % package_name) from exc
+
+    try:
+        for current, dirnames, filenames in os.walk(
+                root, topdown=True, followlinks=False, onerror=walk_error):
+            retained_dirs = []
+            for name in sorted(dirnames):
+                path = os.path.join(current, name)
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise StartupIdentityError(
+                        "%s package contains a symlink/special directory" % package_name)
+                if name == ".git":
+                    continue
+                retained_dirs.append(name)
+                directories.append({
+                    "path": os.path.relpath(path, root),
+                    "device": info.st_dev, "inode": info.st_ino,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+                })
+            dirnames[:] = retained_dirs
+            for name in sorted(filenames):
+                path = os.path.join(current, name)
+                before = os.lstat(path)
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                    raise StartupIdentityError(
+                        "%s package contains a symlink/special file" % package_name)
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
+                    | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(path, flags)
+                try:
+                    opened = os.fstat(fd)
+                    if _runtime_stat(opened) != _runtime_stat(before):
+                        raise StartupIdentityError(
+                            "%s package changed while fingerprinting" % package_name)
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    after = os.fstat(fd)
+                finally:
+                    os.close(fd)
+                if _runtime_stat(after) != _runtime_stat(opened) \
+                        or _runtime_stat(os.lstat(path)) != _runtime_stat(opened):
+                    raise StartupIdentityError(
+                        "%s package changed while fingerprinting" % package_name)
+                files.append({
+                    "path": os.path.relpath(path, root),
+                    "device": opened.st_dev, "inode": opened.st_ino,
+                    "mode": stat.S_IMODE(opened.st_mode), "size": opened.st_size,
+                    "mtime_ns": opened.st_mtime_ns, "ctime_ns": opened.st_ctime_ns,
+                    "sha256": digest.hexdigest(),
+                })
+        final_root = os.lstat(root)
+    except StartupIdentityError:
+        raise
+    except OSError as exc:
+        raise StartupIdentityError(
+            "cannot fingerprint %s package" % package_name) from exc
+    if _runtime_stat(final_root) != _runtime_stat(root_info):
+        raise StartupIdentityError("%s package root changed while fingerprinting" % package_name)
+    if not files:
+        raise StartupIdentityError("%s package fingerprint is empty" % package_name)
+    envelope = {
+        "package": package_name, "root": root,
+        "root_identity": {
+            "device": root_info.st_dev, "inode": root_info.st_ino,
+            "mode": stat.S_IMODE(root_info.st_mode),
+            "mtime_ns": root_info.st_mtime_ns, "ctime_ns": root_info.st_ctime_ns,
+        },
+        "directories": directories, "files": files,
+    }
+    raw = (json.dumps(envelope, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _runtime_file_identity(path, label):
+    """Bind one executable module file and detect replacement while reading."""
+    if not isinstance(path, str) or not os.path.isabs(path) \
+            or os.path.normpath(path) != path or os.path.realpath(path) != path \
+            or os.path.islink(path):
+        raise StartupIdentityError("%s path is unsafe" % label)
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise StartupIdentityError("%s is not a regular file" % label)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
+            | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if _runtime_stat(opened) != _runtime_stat(before):
+                raise StartupIdentityError("%s changed while opening" % label)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if _runtime_stat(after) != _runtime_stat(opened) \
+                or _runtime_stat(os.lstat(path)) != _runtime_stat(opened):
+            raise StartupIdentityError("%s changed while fingerprinting" % label)
+    except StartupIdentityError:
+        raise
+    except OSError as exc:
+        raise StartupIdentityError("cannot fingerprint %s" % label) from exc
+    return {
+        "path": path, "device": opened.st_dev, "inode": opened.st_ino,
+        "mode": stat.S_IMODE(opened.st_mode), "size": opened.st_size,
+        "mtime_ns": opened.st_mtime_ns, "ctime_ns": opened.st_ctime_ns,
+        "sha256": digest.hexdigest(),
+    }
+
 
 # Keep the module importable for request/security unit tests on machines that do not have the
 # 300GB-serving MLX environment. Production still fails fast in main() before binding a socket if
 # any runtime dependency is unavailable; generation behavior is unchanged when they are present.
 _RUNTIME_IMPORT_ERROR = None
+_PREIMPORT_PACKAGE_TREES = {}
+_PREIMPORT_BATCH_CORE_IDENTITY = None
+mx = load = generate = stream_generate = apply_chat_template = load_config = None
+generate_batch = None
+
+# Force imports to compile source (or use an explicitly sourceless origin), not
+# an unbound ambient __pycache__. Existing bytecode remains part of the complete
+# tree digest, and no import can mutate that tree while startup is being proven.
+sys.dont_write_bytecode = True
+sys.pycache_prefix = os.path.join(
+    tempfile.gettempdir(), ".m3-disabled-pycache-%d-%s" %
+    (os.getpid(), os.urandom(16).hex()))
 try:
+    for _package_name in ("mlx", "mlx_lm", "mlx_vlm"):
+        _spec = importlib.util.find_spec(_package_name)
+        if _spec is None or not isinstance(_spec.origin, str):
+            raise StartupIdentityError("cannot locate runtime package %s" % _package_name)
+        _PREIMPORT_PACKAGE_TREES[_package_name] = \
+            _runtime_package_tree_from_file(_package_name, _spec.origin)
+    _batch_spec = importlib.util.find_spec("m3_batch_core")
+    if _batch_spec is None or not isinstance(_batch_spec.origin, str):
+        raise StartupIdentityError("cannot locate m3_batch_core")
+    _expected_batch_core = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "m3_batch_core.py")
+    if os.path.normpath(_batch_spec.origin) != _expected_batch_core \
+            or os.path.realpath(_batch_spec.origin) != _expected_batch_core:
+        raise StartupIdentityError("m3_batch_core did not resolve beside the server shim")
+    _PREIMPORT_BATCH_CORE_IDENTITY = _runtime_file_identity(
+        _expected_batch_core, "m3_batch_core")
     import mlx.core as mx  # [auditfix] #2/#3: clear_cache after gens + synchronize on cap-abort (mirror glm_serve_batched)
     from mlx_vlm import load, generate, stream_generate
     from mlx_vlm.generate.dispatch import PromptCacheState
     from mlx_vlm.prompt_utils import apply_chat_template
     from mlx_vlm.utils import load_config
+    from m3_batch_core import generate_batch
 except Exception as _e:
     _RUNTIME_IMPORT_ERROR = _e
     mx = load = generate = stream_generate = apply_chat_template = load_config = None
+    generate_batch = None
 
     class PromptCacheState:  # inert placeholder; no generation path is reachable without runtime
         pass
@@ -61,10 +252,6 @@ def _log_error(where, message):
     """Log a server-side error without requiring or exposing an exception string."""
     print("[ERROR] %s @ %s: %s" % (where, time.strftime("%Y-%m-%dT%H:%M:%S"), message),
           file=sys.stderr, flush=True)
-
-
-class StartupIdentityError(RuntimeError):
-    """The configured model cannot be bound to its optional artifact receipt."""
 
 
 def _canonical_realpath(path, field):
@@ -115,11 +302,14 @@ def _artifact_identity(manifest_path, model_realpath):
         standard = {"schema", "kind", "artifact_type", "artifact_id", "created_unix",
                     "label", "version", "candidate", "base", "adapter", "evidence",
                     "metadata"}
-        direction = {"schema", "kind", "artifact_type", "artifact_id", "created_unix",
-                     "label", "version", "candidate", "base", "direction_bundle",
-                     "recipe", "direction_binding", "evidence", "metadata"}
+        direction_v4 = {"schema", "kind", "artifact_type", "artifact_id", "created_unix",
+                        "label", "version", "candidate", "base", "direction_bundle",
+                        "recipe", "direction_binding", "evidence", "metadata"}
+        direction_v5 = direction_v4 | {"input_binding"}
         supported = (value.get("schema") == 3 and set(value) == standard) or (
-            value.get("schema") == 4 and set(value) == direction
+            value.get("schema") == 4 and set(value) == direction_v4
+            and value.get("artifact_type") == "m3-abliteration-build") or (
+            value.get("schema") == 5 and set(value) == direction_v5
             and value.get("artifact_type") == "m3-abliteration-build")
         if not supported:
             raise StartupIdentityError("unsupported or malformed pipeline-artifact receipt")
@@ -631,12 +821,6 @@ def _save_text_create_only(p, text):
 
 # ===== BATCHING WORKER (added for m3_serve_batched) =====================================
 import queue as _queue
-try:
-    from m3_batch_core import generate_batch
-except Exception as _e:
-    generate_batch = None
-    if _RUNTIME_IMPORT_ERROR is None:
-        _RUNTIME_IMPORT_ERROR = _e
 BATCH_MAX = int(os.environ.get("M3_BATCH_MAX", "4"))
 # [auditfix] concurrency: 12 -> 150ms. A 12ms window almost never actually coalesced real traffic
 # (Slack-Alfred's parallel calls arrive over tens of ms; trader+chat overlap over seconds), so in
@@ -654,7 +838,26 @@ BATCH_MAX_PROMPT_TOK = int(os.environ.get("M3_BATCH_MAX_PROMPT_TOK", "6144"))  #
 # a strictly-increasing tiebreaker so (a) same-priority jobs stay FIFO and (b) the tuple ordering never
 # has to compare two _Job objects (they are not comparable). Env-less behavior is unchanged: absent the
 # X-M3-Priority header every request is priority 1, so a single-class stream behaves exactly like today.
-JOBQ = _queue.PriorityQueue()
+def _positive_queue_setting(name, default):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s must be a positive integer" % name) from exc
+    if value < 1:
+        raise ValueError("%s must be a positive integer" % name)
+    return value
+
+
+# MAX_PENDING remains the ordinary/default-class backlog ceiling. The bounded queue has additional
+# owner-authenticated priority-0 slots which ordinary and bench requests cannot consume.
+MAX_PENDING = _positive_queue_setting("M3_MAX_PENDING", 8)
+PRIORITY0_RESERVED = _positive_queue_setting("M3_PRIORITY0_RESERVED", 2)
+MAX_TOTAL_PENDING = MAX_PENDING + PRIORITY0_RESERVED
+JOBQ = _queue.PriorityQueue(maxsize=MAX_TOTAL_PENDING)
+# Admission slots track queued jobs even during the worker's get/requeue priority peek. That makes
+# the requeue non-blocking without briefly opening a slot that another request could steal.
+_QUEUE_SLOTS = threading.BoundedSemaphore(MAX_TOTAL_PENDING)
+_ADMISSION_LOCK = threading.Lock()
 _SEQ_LOCK = threading.Lock()
 _SEQ = 0
 def _next_seq():
@@ -662,7 +865,6 @@ def _next_seq():
     with _SEQ_LOCK:
         _SEQ += 1
         return _SEQ
-MAX_PENDING = int(os.environ.get("M3_MAX_PENDING", "8"))  # shed (503) when pending backlog >= this
 EOS_IDS = set()
 
 # --- metrics (increment-1 #5): dependency-free Prometheus text exposition on GET /metrics.
@@ -707,6 +909,11 @@ def _metrics_text():
         "m3_p2_total %d" % m["p2_total"],
         "# HELP m3_queue_depth pending jobs in the worker queue", "# TYPE m3_queue_depth gauge",
         "m3_queue_depth %d" % JOBQ.qsize(),
+        "# HELP m3_queue_capacity hard pending-job limit", "# TYPE m3_queue_capacity gauge",
+        "m3_queue_capacity %d" % MAX_TOTAL_PENDING,
+        "# HELP m3_priority0_reserved slots reserved for authenticated priority-0 work",
+        "# TYPE m3_priority0_reserved gauge",
+        "m3_priority0_reserved %d" % PRIORITY0_RESERVED,
         "# TYPE m3_avg_batch_rows gauge", "m3_avg_batch_rows %.2f" % avg_batch,
         "# HELP m3_gpu_active_bytes MLX active Metal memory", "# TYPE m3_gpu_active_bytes gauge",
         "m3_gpu_active_bytes %d" % active,
@@ -735,20 +942,30 @@ def _enqueue(msgs, mt, temp, think, tools, images=None, lp=None, priority=1, str
     """[inc2/inc3] Shed by priority, build a _Job, and put (priority, seq, job) on the PriorityQueue.
     Returns the enqueued job WITHOUT waiting (the streaming path drains stream_q itself; the blocking
     path waits on j.ev via submit_and_wait). Raises Busy when the backlog shed rejects the request.
-    Shed policy (MAX_PENDING = default backlog bound):
-      * priority 0 (urgent/trader): EXEMPT — always queued, even at backlog (never dropped).
+    Shed policy (MAX_PENDING = ordinary backlog bound; MAX_TOTAL_PENDING = hard bound):
+      * priority 0 (urgent/trader): may use the reserved tail, but sheds at the hard bound.
       * priority 2 (bench): sheds FIRST — threshold MAX_PENDING//2 so bench yields headroom early.
       * priority 1 (default): unchanged — sheds at MAX_PENDING."""
-    depth = JOBQ.qsize()
-    if priority == 2:
-        if depth >= max(1, MAX_PENDING // 2):
-            raise Busy()
-    elif priority != 0:  # default class (1); priority 0 is exempt from the shed entirely
-        if depth >= MAX_PENDING:
-            raise Busy()
-    _metric_add(**{"p%d_total" % priority: 1})  # [inc2] per-priority-class counter (admitted requests)
     j = _Job(msgs, mt, temp, think, tools, images, lp=lp, priority=priority, stream_q=stream_q)
-    JOBQ.put((priority, _next_seq(), j))
+    # qsize()+put must be one admission transaction. Without this lock, concurrent request threads
+    # can all observe the same free slot and over-admit before any of them calls put().
+    with _ADMISSION_LOCK:
+        depth = JOBQ.qsize()
+        if depth >= MAX_TOTAL_PENDING:
+            raise Busy()
+        if priority == 2 and depth >= max(1, MAX_PENDING // 2):
+            raise Busy()
+        if priority != 0 and depth >= MAX_PENDING:
+            raise Busy()
+        if not _QUEUE_SLOTS.acquire(blocking=False):
+            raise Busy()
+        try:
+            JOBQ.put_nowait((priority, _next_seq(), j))
+        except _queue.Full as exc:
+            # The PriorityQueue maxsize is a second, non-bypassable hard stop.
+            _QUEUE_SLOTS.release()
+            raise Busy() from exc
+    _metric_add(**{"p%d_total" % priority: 1})  # [inc2] per-priority-class counter (admitted requests)
     return j
 
 def submit_and_wait(msgs, mt, temp, think, tools, images=None, lp=None, priority=1):
@@ -816,6 +1033,7 @@ def _do_batched(jobs, id_lists):
 def _batch_worker():
     while True:
         first = JOBQ.get()[2]   # [inc2] PriorityQueue yields (priority, seq, job); unwrap the job
+        _QUEUE_SLOTS.release()  # first is active now, not pending
         jobs = [first]
         p0 = first.priority
         try:  # [auditfix] #16: see except at the bottom — a worker escape must not be a silent brownout
@@ -832,8 +1050,11 @@ def _batch_worker():
                     try: nitem = JOBQ.get(timeout=rem)
                     except _queue.Empty: break
                     if nitem[2].priority != p0:
-                        JOBQ.put(nitem)  # different class -> leave it for the next worker loop
+                        # Keep its admission slot held across this get/requeue so a request thread
+                        # cannot fill the queue and deadlock the sole worker on a blocking put.
+                        JOBQ.put_nowait(nitem)
                         break
+                    _QUEUE_SLOTS.release()  # gathered into the active batch, no longer pending
                     jobs.append(nitem[2])
             live = []
             for j in jobs:  # [auditfix] #4: drop jobs whose caller already timed out while queued
@@ -1395,43 +1616,32 @@ def _json_safe_runtime(value):
     return str(value)
 
 
-def _runtime_package_tree_sha256():
-    """Fingerprint the loaded mlx_vlm package source, including editable installs."""
+def _runtime_package_tree_sha256(package_name):
+    """Fingerprint the on-disk tree that supplied one loaded MLX package."""
     try:
-        import mlx_vlm as package
-        root = os.path.dirname(os.path.realpath(package.__file__))
-        records = []
-        for current, dirnames, filenames in os.walk(root, topdown=True,
-                                                     followlinks=False):
-            retained_dirs = []
-            for name in sorted(dirnames):
-                path = os.path.join(current, name)
-                if os.path.islink(path) or not os.path.isdir(path):
-                    raise StartupIdentityError(
-                        "mlx_vlm package contains a symlink/special directory")
-                if name not in {"__pycache__", ".git"}:
-                    retained_dirs.append(name)
-            dirnames[:] = retained_dirs
-            for name in sorted(filenames):
-                if name.endswith((".pyc", ".pyo")):
-                    continue
-                path = os.path.join(current, name)
-                if os.path.islink(path) or not os.path.isfile(path):
-                    raise StartupIdentityError("mlx_vlm package contains a symlink/special file")
-                digest = hashlib.sha256()
-                with open(path, "rb") as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                records.append({"path": os.path.relpath(path, root),
-                                "size": os.path.getsize(path),
-                                "sha256": digest.hexdigest()})
-        if not records:
-            raise StartupIdentityError("mlx_vlm package fingerprint is empty")
-        raw = (json.dumps(records, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
-        return hashlib.sha256(raw).hexdigest()
-    except ImportError:
-        return None
+        package = __import__(package_name)
+    except Exception as exc:
+        raise StartupIdentityError("cannot import runtime package %s" % package_name) from exc
+    return _runtime_package_tree_from_file(
+        package_name, os.path.normpath(getattr(package, "__file__", "")))
+
+
+def _verified_runtime_code_identity():
+    """Reprove that the loaded runtime still matches the pre-import snapshot."""
+    loaded_batch_core = sys.modules.get("m3_batch_core")
+    batch_core_path = os.path.normpath(getattr(loaded_batch_core, "__file__", ""))
+    current_batch_core = _runtime_file_identity(batch_core_path, "m3_batch_core")
+    current_package_trees = {
+        name: _runtime_package_tree_sha256(name)
+        for name in ("mlx", "mlx_lm", "mlx_vlm")
+    }
+    if current_package_trees != _PREIMPORT_PACKAGE_TREES:
+        raise StartupIdentityError(
+            "MLX runtime package tree changed between import and readiness")
+    if current_batch_core != _PREIMPORT_BATCH_CORE_IDENTITY:
+        raise StartupIdentityError(
+            "m3_batch_core changed between import and readiness")
+    return current_package_trees, current_batch_core
 
 
 def _initialize_runtime_identity():
@@ -1445,8 +1655,7 @@ def _initialize_runtime_identity():
     if not out or os.path.lexists(out):
         raise StartupIdentityError("M3 runtime receipt destination changed before publication")
     script_path = os.path.realpath(__file__)
-    with open(script_path, "rb") as stream:
-        script_sha = hashlib.sha256(stream.read()).hexdigest()
+    script_sha = _runtime_file_identity(script_path, "M3 server shim")["sha256"]
     versions = {}
     try:
         import importlib.metadata as metadata
@@ -1455,9 +1664,8 @@ def _initialize_runtime_identity():
             except metadata.PackageNotFoundError: versions[package] = None
     except Exception:
         versions = {"mlx": None, "mlx-lm": None, "mlx-vlm": None}
-    batch_core_path = os.path.join(os.path.dirname(script_path), "m3_batch_core.py")
-    with open(batch_core_path, "rb") as stream:
-        batch_core_sha = hashlib.sha256(stream.read()).hexdigest()
+    current_package_trees, current_batch_core = _verified_runtime_code_identity()
+    batch_core_sha = current_batch_core["sha256"]
     try:
         default_device = str(mx.default_device())
     except Exception:
@@ -1473,7 +1681,9 @@ def _initialize_runtime_identity():
         "packages": versions,
         "shim_sha256": script_sha,
         "batch_core_sha256": batch_core_sha,
-        "mlx_vlm_tree_sha256": _runtime_package_tree_sha256(),
+        "mlx_tree_sha256": current_package_trees["mlx"],
+        "mlx_lm_tree_sha256": current_package_trees["mlx_lm"],
+        "mlx_vlm_tree_sha256": current_package_trees["mlx_vlm"],
         "model_id": MODEL_ID,
         "model_class": "%s.%s" % (type(MODEL).__module__, type(MODEL).__qualname__),
         "processor_class": "%s.%s" % (type(PROC).__module__, type(PROC).__qualname__),
@@ -1489,6 +1699,8 @@ def _initialize_runtime_identity():
         "batch_window_ms": BATCH_WINDOW_MS,
         "batch_max_prompt_tokens": BATCH_MAX_PROMPT_TOK,
         "max_pending": MAX_PENDING,
+        "priority0_reserved": PRIORITY0_RESERVED,
+        "max_total_pending": MAX_TOTAL_PENDING,
         "lock_wait_seconds": LOCK_WAIT_S,
         "prefill_step": PREFILL_STEP,
         "max_generation_seconds": MAX_GEN_S,

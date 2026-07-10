@@ -27,9 +27,14 @@ managed loopback-to-LAN proxy when remote access is required.
   owner-only directory and uses create-only owner-only files.
 - Evaluation/promotion startup can bind a canonical pipeline artifact/reference
   receipt. Health then exposes a create-only runtime receipt containing the exact
-  custom-Python shim, batch core, complete loaded `mlx_vlm` package tree, MLX
+  custom-Python shim, batch core, complete loaded `mlx`, `mlx_lm`, and `mlx_vlm`
+  package trees (including native artifacts), MLX
   versions, realized device, and cache/generation contract; readiness is not
   published until that receipt is durable.
+- Runtime package and batch-core identities are taken before import and reproved
+  after model load. Traversal errors fail startup, bytecode is included in the
+  tree identity, and imports use an isolated no-write bytecode cache so the
+  receipt cannot describe different code from the code resident in memory.
 
 ## Runtime
 
@@ -63,7 +68,8 @@ Important environment controls:
 | `M3_MAX_BODY_BYTES` | `20971520` | Request-body cap |
 | `M3_MAX_IMG_BYTES` | `12582912` | Decoded image cap |
 | `M3_MAX_TOKENS` | `16384` | Per-request output cap |
-| `M3_MAX_PENDING` | `8` | Queued request cap |
+| `M3_MAX_PENDING` | `8` | Ordinary/default queued-request ceiling |
+| `M3_PRIORITY0_RESERVED` | `2` | Additional hard-bounded slots reserved for authenticated priority-0 work |
 | `M3_PRIORITY_TOKEN_FILE` | unset | Owner-only priority credential |
 | `M3_ARTIFACT_MANIFEST` | unset | Canonical artifact/reference receipt that must bind `M3_MODEL_DIR` |
 | `M3_RUNTIME_RECEIPT_DIR` | unset | Owner-only directory for unique create-only runtime receipts (required with a manifest) |

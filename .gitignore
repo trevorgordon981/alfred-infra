@@ -28,3 +28,6 @@ venv/
 .env.*
 *.key
 *.pem
+*.age
+k3s-backups/
+backup-heartbeats/

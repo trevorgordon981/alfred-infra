@@ -20,6 +20,11 @@ Adapt the role labels (`rag`, `voice`) to whatever workloads your GPU nodes run.
 | File | Purpose |
 |------|---------|
 | `alfred-backup.sh` | Cold backup. Pulls RAG + voice workloads from Sparks, collects Mac Studio configs, pushes everything to both nodes. |
+| `scripts/config-backup.sh` | Fail-closed, secret-excluding Studio configuration snapshot to a credential-free SSH/verified-HTTPS remote. |
+| `scripts/backup-guard.sh` | Preserves the wrapped backup status and advances a heartbeat only after genuine success. |
+| `scripts/k3s-backup.sh` | Encrypts the k3s datastore and Sealed Secrets controller keys with `age`; omits ordinary Kubernetes Secrets. |
+| `scripts/k3s-RESTORE.md` | Required restore/legacy-plaintext cleanup and drill procedure. |
+| `scripts/alfred-status-api.py` | Loopback-only, fail-closed bearer-authenticated read-only status bridge. |
 | `alfred-health.sh` | HTTP + SSH health checks across the whole cluster. |
 | `setup-monitoring.sh` | Installs `node_exporter` (all machines) + DCGM GPU exporter (Sparks). Interactive, machine-by-machine. |
 | `check-bindings.sh` | Audits which services are on 0.0.0.0 vs Tailscale-only. Shows fix commands. |

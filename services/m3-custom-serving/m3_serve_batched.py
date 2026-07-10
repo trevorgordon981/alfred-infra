@@ -8,7 +8,7 @@
 GET / -> "ready"; GET /v1/models -> OpenAI model list (health/up-checks).
 Thinking defaults OFF (mandatory-thinking is what stalled M2.7 on the breakout brief); opt in per-request
 via a leading "think:" on the last user message, or an explicit {"thinking":"enabled"} field."""
-import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math, hashlib, importlib.util  # [auditfix] +sys/traceback (#5), +random (#10)
+import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math, hashlib, importlib.util, signal  # [auditfix] +sys/traceback (#5), +random (#10)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -384,6 +384,56 @@ _ARTIFACT_MANIFEST = (os.environ.get("M3_ARTIFACT_MANIFEST")
 # receipt error therefore terminates startup rather than serving an unbound model.
 SERVER_IDENTITY = _build_startup_identity(MD, _ARTIFACT_MANIFEST)
 _RUNTIME_RECEIPT_OUT = None
+_MACHINE_RESOURCE_TOKEN = None
+_MACHINE_RESOURCE_OWNED = False
+
+
+def _machine_resource_module():
+    """Load the adjacent lease implementation without trusting ambient PYTHONPATH."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "machine_resource_lease.py")
+    spec = importlib.util.spec_from_file_location("m3_machine_resource_lease", path)
+    if spec is None or spec.loader is None:
+        raise StartupIdentityError("cannot load machine resource lease implementation")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _acquire_machine_resource():
+    """Acquire or re-prove the train/build/eval/serve machine-wide lease."""
+    global _MACHINE_RESOURCE_TOKEN, _MACHINE_RESOURCE_OWNED
+    expanded = os.path.expanduser(os.environ.get(
+        "M3_MACHINE_RESOURCE_LOCK", "~/.local/state/alfred-machine-resource.lock"))
+    if not os.path.isabs(expanded) or os.path.normpath(expanded) != expanded \
+            or os.path.realpath(expanded) != expanded:
+        raise StartupIdentityError("M3_MACHINE_RESOURCE_LOCK must be canonical and absolute")
+    path = expanded
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    os.chmod(parent, 0o700)
+    lease = _machine_resource_module()
+    inherited = os.environ.get("ALFRED_MACHINE_RESOURCE_TOKEN")
+    try:
+        if inherited:
+            lease.assert_owned(path, inherited)
+            _MACHINE_RESOURCE_TOKEN = inherited
+            _MACHINE_RESOURCE_OWNED = False
+        else:
+            _MACHINE_RESOURCE_TOKEN = lease.acquire(path, "custom Python M3 serving")
+            _MACHINE_RESOURCE_OWNED = True
+    except lease.LeaseError as exc:
+        raise StartupIdentityError("machine resource lease is unavailable") from exc
+    return path
+
+
+def _release_machine_resource(path):
+    global _MACHINE_RESOURCE_TOKEN, _MACHINE_RESOURCE_OWNED
+    if _MACHINE_RESOURCE_OWNED and _MACHINE_RESOURCE_TOKEN:
+        lease = _machine_resource_module()
+        lease.release(path, _MACHINE_RESOURCE_TOKEN)
+    _MACHINE_RESOURCE_TOKEN = None
+    _MACHINE_RESOURCE_OWNED = False
 
 # WEDGE FIX (2026-06-22): bind the listening socket BEFORE loading the 256GB of weights, so the
 # port LISTENs in milliseconds and the watchdog can always see a live socket. Real inference is
@@ -1601,6 +1651,9 @@ def _runtime_receipt_output():
 def _prepare_runtime_identity():
     """Fail before socket bind if the immutable receipt cannot be published safely."""
     global _RUNTIME_RECEIPT_OUT
+    if _ARTIFACT_MANIFEST is None:
+        raise StartupIdentityError(
+            "M3_ARTIFACT_MANIFEST is required before readiness can be established")
     _RUNTIME_RECEIPT_OUT = _runtime_receipt_output()
 
 
@@ -1644,11 +1697,11 @@ def _verified_runtime_code_identity():
     return current_package_trees, current_batch_core
 
 
-def _initialize_runtime_identity():
+def _initialize_runtime_identity(readiness_smoke=None):
     """Bind the loaded custom-Python runtime immediately before READY becomes true."""
     global _RUNTIME_RECEIPT_OUT
     if _ARTIFACT_MANIFEST is None:
-        return
+        raise StartupIdentityError("runtime identity requires an artifact manifest")
     if MODEL is None or PROC is None or CFG is None:
         raise StartupIdentityError("runtime identity requires the realized loaded model")
     out = _RUNTIME_RECEIPT_OUT or _runtime_receipt_output()
@@ -1674,6 +1727,12 @@ def _initialize_runtime_identity():
         device_info = _json_safe_runtime(mx.metal.device_info())
     except Exception:
         device_info = None
+    if not isinstance(readiness_smoke, dict) \
+            or readiness_smoke.get("schema") != "m3-readiness-smoke.v1":
+        raise StartupIdentityError("runtime identity requires completed readiness smoke evidence")
+    smoke_raw = (json.dumps(readiness_smoke, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    smoke_sha = hashlib.sha256(smoke_raw).hexdigest()
     contract = {
         "schema": "pipeline-m3-runtime-contract.v1",
         "backend": "custom-python-mlx",
@@ -1707,6 +1766,7 @@ def _initialize_runtime_identity():
         "clear_cache_steps": CLEAR_CACHE_STEPS,
         "max_tokens": M3_MAX_TOKENS,
         "max_temperature": M3_MAX_TEMPERATURE,
+        "readiness_smoke_sha256": smoke_sha,
     }
     contract_bytes = (json.dumps(contract, sort_keys=True, separators=(",", ":"),
                                  ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
@@ -1723,6 +1783,8 @@ def _initialize_runtime_identity():
         "pid": SERVER_IDENTITY["pid"],
         "started_unix": SERVER_IDENTITY["started_unix"],
         "startup_nonce": SERVER_IDENTITY["startup_nonce"],
+        "readiness_smoke": readiness_smoke,
+        "readiness_smoke_sha256": smoke_sha,
     }
     raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
@@ -1739,7 +1801,74 @@ def _initialize_runtime_identity():
         if tmp and os.path.exists(tmp): os.unlink(tmp)
     SERVER_IDENTITY["runtime_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
     SERVER_IDENTITY["runtime_contract_sha256"] = contract_sha
+    SERVER_IDENTITY["readiness_smoke_sha256"] = smoke_sha
     SERVER_IDENTITY["runtime_receipt"] = receipt
+
+
+def _smoke_result(name, prompt, out):
+    text = strip_think(getattr(out, "text", "") or "", "disabled")
+    if not text.strip():
+        raise StartupIdentityError("%s readiness smoke returned empty output" % name)
+    return {"name": name, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "prompt_tokens": int(getattr(out, "prompt_tokens", 0) or 0),
+            "generation_tokens": int(getattr(out, "generation_tokens", 0) or 0)}
+
+
+def _run_readiness_smoke():
+    """Exercise plain, constrained-JSON, tool and true-stream production paths."""
+    tests = []
+    plain_prompt = "Reply with exactly: READY"
+    plain = _run([{"role": "user", "content": plain_prompt}], 8, 0.0,
+                 "disabled", None)
+    tests.append(_smoke_result("plain-json-envelope", plain_prompt, plain))
+
+    structured_prompt = 'Return only the JSON object {"ready":true}.'
+    response_format = {"type": "json_schema", "json_schema": {"schema": {
+        "type": "object", "properties": {"ready": {"type": "boolean"}},
+        "required": ["ready"], "additionalProperties": False}}}
+    processors = _build_json_lp(response_format, "disabled", explicit=True)
+    structured = _run([{"role": "user", "content": structured_prompt}], 32, 0.0,
+                      "disabled", None, logits_processors=processors)
+    structured_text = strip_think(getattr(structured, "text", "") or "", "disabled")
+    try:
+        structured_value = json.loads(structured_text)
+    except ValueError as exc:
+        raise StartupIdentityError("structured-JSON readiness smoke was not JSON") from exc
+    if structured_value != {"ready": True}:
+        raise StartupIdentityError("structured-JSON readiness smoke violated its schema")
+    tests.append(_smoke_result("structured-json", structured_prompt, structured))
+
+    tool_prompt = "Call health_probe now with an empty argument object; do not answer in text."
+    tools = [{"type": "function", "function": {"name": "health_probe",
+              "description": "Return server readiness", "parameters": {
+                  "type": "object", "properties": {}, "additionalProperties": False}}}]
+    tool_out = _run([{"role": "user", "content": tool_prompt}], 64, 0.0,
+                    "disabled", tools)
+    calls, _content = parse_minimax_tools(getattr(tool_out, "text", "") or "", tools)
+    if not calls or len(calls) != 1 \
+            or calls[0].get("function", {}).get("name") != "health_probe" \
+            or json.loads(calls[0]["function"]["arguments"]) != {}:
+        raise StartupIdentityError("tool-format readiness smoke did not emit health_probe")
+    tests.append(_smoke_result("tool-format", tool_prompt, tool_out))
+
+    stream_prompt = "Reply with exactly: STREAM_READY"
+    stream_queue = _queue.Queue()
+    streamed = _run([{"role": "user", "content": stream_prompt}], 12, 0.0,
+                    "disabled", None, stream_q=stream_queue)
+    events = []
+    while not stream_queue.empty():
+        events.append(stream_queue.get_nowait())
+    if not events or events[-1] != ("done", None) \
+            or sum(1 for event in events if event == ("done", None)) != 1:
+        raise StartupIdentityError("stream readiness smoke lacks one terminal sentinel")
+    streamed_text = "".join(payload for kind, payload in events if kind == "tok")
+    if not streamed_text.strip() or streamed_text != (getattr(streamed, "text", "") or ""):
+        raise StartupIdentityError("stream readiness smoke output/event mismatch")
+    tests.append(_smoke_result("true-stream", stream_prompt, streamed))
+    return {"schema": "m3-readiness-smoke.v1", "startup_nonce": SERVER_IDENTITY["startup_nonce"],
+            "artifact_id": SERVER_IDENTITY["artifact_id"], "tests": tests,
+            "created_unix": int(time.time())}
 
 
 def _load():
@@ -1760,18 +1889,17 @@ def _load():
     elif isinstance(_eos, (list, tuple)): EOS_IDS.update(int(x) for x in _eos)
     if not EOS_IDS: EOS_IDS.add(200020)
     assert EOS_IDS, "EOS_IDS empty — batched path would never stop"  # [audit C2] belt-and-suspenders
-    # warmup (increment-1 #5): compile the Metal decode kernels with one throwaway gen BEFORE we
-    # flip READY, so the first real trade decision doesn't pay first-call kernel-compile latency.
+    # Fail-closed readiness exercises every production protocol before READY.
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            _wp = apply_chat_template(PROC, CFG, [{"role": "user", "content": "ok"}], num_images=0, thinking_mode="disabled")
-            generate(MODEL, PROC, _wp, max_tokens=2, temperature=0.0, verbose=True)
-        print("warmup gen done", flush=True)
+        readiness_smoke = _run_readiness_smoke()
+        print("readiness smoke done", flush=True)
     except Exception as _we:
-        print("warmup gen failed (non-fatal): %s" % _we, flush=True)
+        print("FATAL readiness smoke failed: %s" % _we, flush=True)
+        _log_exc("_run_readiness_smoke")
+        raise StartupIdentityError("readiness smoke failed") from _we
     threading.Thread(target=_batch_worker, daemon=True).start()
-    _initialize_runtime_identity()
-    READY = True   # flip READY only after warmup + worker up
+    _initialize_runtime_identity(readiness_smoke)
+    READY = True   # flip READY only after smoke + worker + create-only runtime receipt
     print("batching worker: max=%d window=%dms eos=%s" % (BATCH_MAX, BATCH_WINDOW_MS, sorted(EOS_IDS)), flush=True)
     print("LOADED — serving 127.0.0.1:%d" % PORT, flush=True)
 
@@ -1780,15 +1908,25 @@ def main():
     """Bind the localhost server and load the model. Imports/tests never execute this path."""
     if _RUNTIME_IMPORT_ERROR is not None or generate_batch is None:
         raise RuntimeError("M3 serving runtime dependencies are unavailable") from _RUNTIME_IMPORT_ERROR
-    _prepare_runtime_identity()
-    # Bind + start serving FIRST (port LISTENs in ms), THEN load the weights on the main thread.
-    ThreadingHTTPServer.allow_reuse_address = True
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), H)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    print("LISTENING 127.0.0.1:%d (loading weights, serving 503 until ready)" % PORT, flush=True)
-    _load()
-    # Block the main thread forever; the daemon serve thread handles requests.
-    threading.Event().wait()
+    lease_path = _acquire_machine_resource()
+    httpd = None
+    stop = threading.Event()
+    try:
+        _prepare_runtime_identity()
+        # Bind + start serving FIRST (port LISTENs in ms), THEN load weights on the main thread.
+        ThreadingHTTPServer.allow_reuse_address = True
+        httpd = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print("LISTENING 127.0.0.1:%d (loading weights, serving 503 until ready)" % PORT, flush=True)
+        _load()
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
+        signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
+        stop.wait()
+    finally:
+        if httpd is not None:
+            with contextlib.suppress(Exception): httpd.shutdown()
+            with contextlib.suppress(Exception): httpd.server_close()
+        _release_machine_resource(lease_path)
 
 
 if __name__ == "__main__":

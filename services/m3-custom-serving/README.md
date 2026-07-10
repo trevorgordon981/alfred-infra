@@ -35,6 +35,15 @@ managed loopback-to-LAN proxy when remote access is required.
   after model load. Traversal errors fail startup, bytecode is included in the
   tree identity, and imports use an isolated no-write bytecode cache so the
   receipt cannot describe different code from the code resident in memory.
+- Readiness is fail-closed: an artifact/reference manifest is mandatory, and
+  representative plain, constrained-JSON, native tool-call, and true-stream
+  generations must all succeed. Their prompt/output digests and token counts
+  are embedded in and cryptographically bound by the create-only runtime
+  receipt. A failed warmup never becomes `ready:true`.
+- Serving holds the same owner-token machine resource lease as training,
+  full-model builds, and evaluation. Pipeline children re-prove an inherited
+  token; standalone serving owns the lease for its full lifetime. It never
+  expires by age.
 
 ## Runtime
 
@@ -74,6 +83,7 @@ Important environment controls:
 | `M3_ARTIFACT_MANIFEST` | unset | Canonical artifact/reference receipt that must bind `M3_MODEL_DIR` |
 | `M3_RUNTIME_RECEIPT_DIR` | unset | Owner-only directory for unique create-only runtime receipts (required with a manifest) |
 | `M3_RUNTIME_RECEIPT` | unset | Optional explicit fresh receipt path for one-shot launches |
+| `M3_MACHINE_RESOURCE_LOCK` | `~/.local/state/alfred-machine-resource.lock` | Shared train/build/eval/serve lease |
 | `M3_ALLOW_SAVE_TO` | `0` | Enable confined create-only saves |
 | `M3_SAVE_DIR` | `~/m3_saves` | Confined save root |
 
@@ -88,6 +98,7 @@ ordering, and structured-output fail-closed behavior:
 python -m unittest -v tests/test_m3_serve_batched_security.py
 ```
 
-A production deployment additionally requires a real-model structured JSON
-request and streaming smoke. Do not restart a resident model for source-only
-test or publication work.
+A production deployment still requires supervised real-model validation. The
+server itself now runs structured JSON, tool-format, and streaming smokes before
+readiness and receipts their outcomes. Do not restart a resident model for
+source-only test or publication work.

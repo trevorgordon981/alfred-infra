@@ -540,6 +540,10 @@ class StartupIdentityTests(unittest.TestCase):
                 SERVER.SERVER_IDENTITY = identity
                 SERVER._RUNTIME_RECEIPT_OUT = None
                 SERVER.MODEL, SERVER.PROC, SERVER.CFG = object(), object(), object()
+                smoke = {"schema": "m3-readiness-smoke.v1", "startup_nonce":
+                         "0123456789abcdef0123456789abcdef",
+                         "artifact_id": "0123456789abcdef0123456789abcdef",
+                         "tests": [{"name": "mock"}], "created_unix": 1}
                 with mock.patch.object(
                         SERVER, "_runtime_package_tree_sha256",
                         side_effect=lambda package: runtime_digests[package]), \
@@ -556,7 +560,7 @@ class StartupIdentityTests(unittest.TestCase):
                         mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
                         mock.patch.dict(os.environ,
                                         {"M3_RUNTIME_RECEIPT_DIR": str(runtime)}, clear=False):
-                    SERVER._initialize_runtime_identity()
+                    SERVER._initialize_runtime_identity(smoke)
                 self.assertRegex(identity["runtime_receipt_sha256"], r"^[0-9a-f]{64}$")
                 self.assertRegex(identity["runtime_contract_sha256"], r"^[0-9a-f]{64}$")
                 receipts = list(runtime.glob("runtime.M3.*.json"))
@@ -575,6 +579,9 @@ class StartupIdentityTests(unittest.TestCase):
                                  receipt["contract"]["max_total_pending"])
                 self.assertEqual(SERVER.PRIORITY0_RESERVED,
                                  receipt["contract"]["priority0_reserved"])
+                self.assertEqual(smoke, receipt["readiness_smoke"])
+                self.assertEqual(identity["readiness_smoke_sha256"],
+                                 receipt["readiness_smoke_sha256"])
                 contract_raw = (json.dumps(receipt["contract"], sort_keys=True,
                                            separators=(",", ":"), ensure_ascii=True,
                                            allow_nan=False) + "\n").encode("ascii")
@@ -584,11 +591,72 @@ class StartupIdentityTests(unittest.TestCase):
                         mock.patch.dict(os.environ,
                                         {"M3_RUNTIME_RECEIPT_DIR": str(runtime)}, clear=False), \
                         self.assertRaises(SERVER.StartupIdentityError):
-                    SERVER._initialize_runtime_identity()
+                    SERVER._initialize_runtime_identity(smoke)
             finally:
                 SERVER.SERVER_IDENTITY = old
                 SERVER._RUNTIME_RECEIPT_OUT = old_runtime_out
                 SERVER.MODEL, SERVER.PROC, SERVER.CFG = old_loaded
+
+    def test_prepare_readiness_requires_artifact_manifest(self):
+        with mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", None), \
+                self.assertRaisesRegex(SERVER.StartupIdentityError, "required"):
+            SERVER._prepare_runtime_identity()
+
+
+class ReadinessSmokeTests(unittest.TestCase):
+    def test_all_protocol_smokes_are_required_and_receipted(self):
+        outputs = [
+            SimpleNamespace(text="READY", prompt_tokens=3, generation_tokens=1),
+            SimpleNamespace(text='{"ready":true}', prompt_tokens=5, generation_tokens=4),
+            SimpleNamespace(text='<tool_call><invoke name="health_probe"></invoke></tool_call>',
+                            prompt_tokens=7, generation_tokens=5),
+        ]
+
+        def fake_run(_messages, _mt, _temp, _think, _tools, **kwargs):
+            if kwargs.get("stream_q") is not None:
+                out = SimpleNamespace(text="STREAM_READY", prompt_tokens=3,
+                                      generation_tokens=1)
+                kwargs["stream_q"].put(("tok", out.text))
+                kwargs["stream_q"].put(("done", None))
+                return out
+            return outputs.pop(0)
+
+        identity = dict(SERVER.SERVER_IDENTITY)
+        identity.update({"startup_nonce": "a" * 32, "artifact_id": "b" * 32})
+        with mock.patch.object(SERVER, "SERVER_IDENTITY", identity), \
+                mock.patch.object(SERVER, "_run", side_effect=fake_run), \
+                mock.patch.object(SERVER, "_build_json_lp", return_value=[object()]):
+            receipt = SERVER._run_readiness_smoke()
+        self.assertEqual("m3-readiness-smoke.v1", receipt["schema"])
+        self.assertEqual(["plain-json-envelope", "structured-json", "tool-format", "true-stream"],
+                         [test["name"] for test in receipt["tests"]])
+
+    def test_any_failed_smoke_blocks_readiness(self):
+        with mock.patch.object(SERVER, "_run",
+                               return_value=SimpleNamespace(text="", prompt_tokens=0,
+                                                            generation_tokens=0)), \
+                self.assertRaises(SERVER.StartupIdentityError):
+            SERVER._run_readiness_smoke()
+
+
+class MachineResourceLeaseTests(unittest.TestCase):
+    _manifest = StartupIdentityTests._manifest
+
+    def test_server_lease_blocks_competing_owner_and_releases_cleanly(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            lock = Path(td) / "machine.lock"
+            old_token, old_owned = SERVER._MACHINE_RESOURCE_TOKEN, SERVER._MACHINE_RESOURCE_OWNED
+            try:
+                with mock.patch.dict(os.environ, {"M3_MACHINE_RESOURCE_LOCK": str(lock)}, clear=False):
+                    path = SERVER._acquire_machine_resource()
+                    self.assertTrue(lock.is_dir())
+                    with self.assertRaises(SERVER.StartupIdentityError):
+                        SERVER._acquire_machine_resource()
+                    SERVER._release_machine_resource(path)
+                    self.assertFalse(lock.exists())
+            finally:
+                SERVER._MACHINE_RESOURCE_TOKEN = old_token
+                SERVER._MACHINE_RESOURCE_OWNED = old_owned
 
     def test_runtime_receipt_parent_must_be_owner_controlled(self):
         with tempfile.TemporaryDirectory(dir=HERE) as td:

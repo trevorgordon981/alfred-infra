@@ -94,6 +94,7 @@ class BackupScriptInvariantTests(unittest.TestCase):
         self.assertIn("set -Eeuo pipefail", text)
         self.assertIn("validate_origin", text)
         self.assertIn('git -C "$R" push --quiet', text)
+        self.assertIn('"$HOME/exitmgr-app/README.md"', text)
         self.assertNotIn('"$HOME/.hermes/.env"', text)
         for line in text.splitlines():
             if line.lstrip().startswith("rsync "):

@@ -1,0 +1,27 @@
+name: custom-serving-test
+
+on:
+  push:
+    paths:
+      - "services/m3-custom-serving/**"
+      - ".github/workflows/custom-serving-test.yml"
+  pull_request:
+    paths:
+      - "services/m3-custom-serving/**"
+      - ".github/workflows/custom-serving-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  security-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run dependency-free request/security suite
+        working-directory: services/m3-custom-serving
+        run: python -m unittest -v tests/test_m3_serve_batched_security.py

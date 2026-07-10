@@ -26,6 +26,7 @@ readonly -a EX=(
     --exclude='*.log'
     --exclude='*venv*'
     --exclude='.cache'
+    --exclude='.pytest_cache'
     --exclude='results'
     --exclude='substack'
     --exclude='runs'
@@ -128,7 +129,8 @@ validate_origin
 # during this run.
 chmod -R go-rwx "$R/.git"
 
-mkdir -p "$R/hermes" "$R/exitmgr-app" "$R/gordon-gauntlet"
+mkdir -p "$R/hermes" "$R/exitmgr-app" "$R/gordon-gauntlet" \
+    "$R/serving" "$R/launch-agents" "$R/longcall-manager"
 rsync -a --delete "${EX[@]}" "$HOME/.hermes/skills" "$R/hermes/"
 rsync -a "${EX[@]}" "$HOME/.hermes/SOUL.md" "$HOME/.hermes/config.yaml" "$R/hermes/"
 rsync -a --delete "${EX[@]}" "$HOME/exitmgr-app/exitmgr" "$HOME/exitmgr-app/tests" "$R/exitmgr-app/"
@@ -136,6 +138,16 @@ rsync -a --delete "${EX[@]}" "$HOME/exitmgr-app/data" "$R/exitmgr-app/"
 rsync -a "${EX[@]}" "$HOME"/exitmgr-app/*.py "$HOME/exitmgr-app/config.yaml" \
     "$HOME/exitmgr-app/README.md" "$R/exitmgr-app/"
 rsync -a "${EX[@]}" "$HOME/m3_serve.py" "$R/"
+rsync -a "${EX[@]}" "$HOME/m3_serve_batched.py" "$HOME/m3_batch_core.py" \
+    "$HOME/m3_lan_proxy.py" "$R/serving/"
+rsync -a "${EX[@]}" \
+    "$HOME/Library/LaunchAgents/ai.alfred.m3-prod.plist" \
+    "$HOME/Library/LaunchAgents/ai.alfred.m3-lan-proxy.plist" \
+    "$HOME/Library/LaunchAgents/ai.alfred.status-api.plist" \
+    "$HOME/Library/LaunchAgents/ai.alfred.config-backup.plist" \
+    "$HOME/Library/LaunchAgents/ai.alfred.k3s-backup.plist" \
+    "$R/launch-agents/"
+rsync -a --delete "${EX[@]}" "$HOME/longcall-manager/" "$R/longcall-manager/"
 rsync -a --delete "${EX[@]}" "$HOME/scripts" "$R/"
 rsync -a --delete "${EX[@]}" "$HOME/gordon-gauntlet/batteries" "$R/gordon-gauntlet/"
 rsync -a "${EX[@]}" "$HOME"/gordon-gauntlet/*.py "$HOME"/gordon-gauntlet/*.sh \

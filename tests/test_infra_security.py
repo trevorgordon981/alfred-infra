@@ -95,6 +95,10 @@ class BackupScriptInvariantTests(unittest.TestCase):
         self.assertIn("validate_origin", text)
         self.assertIn('git -C "$R" push --quiet', text)
         self.assertIn('"$HOME/exitmgr-app/README.md"', text)
+        self.assertIn('"$HOME/m3_serve_batched.py"', text)
+        self.assertIn('"$HOME/m3_lan_proxy.py"', text)
+        self.assertIn('"$HOME/longcall-manager/"', text)
+        self.assertIn('ai.alfred.m3-prod.plist', text)
         self.assertNotIn('"$HOME/.hermes/.env"', text)
         for line in text.splitlines():
             if line.lstrip().startswith("rsync "):

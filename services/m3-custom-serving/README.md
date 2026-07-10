@@ -25,6 +25,11 @@ managed loopback-to-LAN proxy when remote access is required.
   available without privilege; unknown priorities become normal priority 1.
 - Arbitrary `save_to` is disabled by default. The opt-in path is confined to an
   owner-only directory and uses create-only owner-only files.
+- Evaluation/promotion startup can bind a canonical pipeline artifact/reference
+  receipt. Health then exposes a create-only runtime receipt containing the exact
+  custom-Python shim, batch core, complete loaded `mlx_vlm` package tree, MLX
+  versions, realized device, and cache/generation contract; readiness is not
+  published until that receipt is durable.
 
 ## Runtime
 
@@ -39,6 +44,8 @@ M3_MODEL_DIR=~/models/MiniMax-M3-6bit-v1-hotpath-abl \
 M3_PORT=8082 \
 M3_APC=1 \
 M3_APC_BLOCKS=4096 \
+M3_ARTIFACT_MANIFEST=/absolute/path/to/artifact-or-reference.json \
+M3_RUNTIME_RECEIPT_DIR=/absolute/owner-only/runtime-receipts \
 PYTHONPATH="$PWD:$PWD/vendor/mlx-vlm" \
 python m3_serve_batched.py
 ```
@@ -58,6 +65,9 @@ Important environment controls:
 | `M3_MAX_TOKENS` | `16384` | Per-request output cap |
 | `M3_MAX_PENDING` | `8` | Queued request cap |
 | `M3_PRIORITY_TOKEN_FILE` | unset | Owner-only priority credential |
+| `M3_ARTIFACT_MANIFEST` | unset | Canonical artifact/reference receipt that must bind `M3_MODEL_DIR` |
+| `M3_RUNTIME_RECEIPT_DIR` | unset | Owner-only directory for unique create-only runtime receipts (required with a manifest) |
+| `M3_RUNTIME_RECEIPT` | unset | Optional explicit fresh receipt path for one-shot launches |
 | `M3_ALLOW_SAVE_TO` | `0` | Enable confined create-only saves |
 | `M3_SAVE_DIR` | `~/m3_saves` | Confined save root |
 

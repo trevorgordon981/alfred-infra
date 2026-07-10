@@ -8,7 +8,7 @@
 GET / -> "ready"; GET /v1/models -> OpenAI model list (health/up-checks).
 Thinking defaults OFF (mandatory-thinking is what stalled M2.7 on the breakout brief); opt in per-request
 via a leading "think:" on the last user message, or an explicit {"thinking":"enabled"} field."""
-import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math  # [auditfix] +sys/traceback (#5), +random (#10)
+import json, contextlib, io, time, os, threading, re, base64, tempfile, sys, traceback, random, hmac, stat, math, hashlib  # [auditfix] +sys/traceback (#5), +random (#10)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Keep the module importable for request/security unit tests on machines that do not have the
@@ -62,6 +62,124 @@ def _log_error(where, message):
     print("[ERROR] %s @ %s: %s" % (where, time.strftime("%Y-%m-%dT%H:%M:%S"), message),
           file=sys.stderr, flush=True)
 
+
+class StartupIdentityError(RuntimeError):
+    """The configured model cannot be bound to its optional artifact receipt."""
+
+
+def _canonical_realpath(path, field):
+    if not isinstance(path, str) or not path or path != path.strip():
+        raise StartupIdentityError("%s must be a non-empty trimmed path" % field)
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded) or os.path.normpath(expanded) != expanded:
+        raise StartupIdentityError("%s must be a normalized absolute path" % field)
+    real = os.path.realpath(expanded)
+    if real != expanded or os.path.islink(expanded):
+        raise StartupIdentityError("%s must not be or traverse a symlink" % field)
+    return real
+
+
+def _strict_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise StartupIdentityError("duplicate artifact JSON key: %s" % key)
+        value[key] = item
+    return value
+
+
+def _artifact_identity(manifest_path, model_realpath):
+    """Read and bind one pipeline artifact manifest without third-party dependencies.
+
+    The digest is over the exact bytes on disk, not normalized JSON, so callers can
+    compare health identity directly with the receipt they approved.
+    """
+    path = _canonical_realpath(manifest_path, "M3_ARTIFACT_MANIFEST")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise StartupIdentityError("cannot read M3_ARTIFACT_MANIFEST: %s" % exc) from exc
+    try:
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_strict_json_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                StartupIdentityError("non-finite artifact JSON value: %s" % token)))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StartupIdentityError("M3_ARTIFACT_MANIFEST is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise StartupIdentityError("M3_ARTIFACT_MANIFEST root must be an object")
+
+    kind = value.get("kind")
+    if kind == "pipeline-artifact":
+        standard = {"schema", "kind", "artifact_type", "artifact_id", "created_unix",
+                    "label", "version", "candidate", "base", "adapter", "evidence",
+                    "metadata"}
+        direction = {"schema", "kind", "artifact_type", "artifact_id", "created_unix",
+                     "label", "version", "candidate", "base", "direction_bundle",
+                     "recipe", "direction_binding", "evidence", "metadata"}
+        supported = (value.get("schema") == 3 and set(value) == standard) or (
+            value.get("schema") == 4 and set(value) == direction
+            and value.get("artifact_type") == "m3-abliteration-build")
+        if not supported:
+            raise StartupIdentityError("unsupported or malformed pipeline-artifact receipt")
+        binding = value.get("candidate")
+        binding_field = "artifact candidate.path"
+    elif kind == "pipeline-reference":
+        expected = {"schema", "kind", "artifact_id", "created_unix", "label", "version",
+                    "role", "model", "evidence", "metadata"}
+        if value.get("schema") != 1 or value.get("role") != "baseline" or set(value) != expected:
+            raise StartupIdentityError("unsupported or malformed pipeline-reference receipt")
+        binding = value.get("model")
+        binding_field = "reference model.path"
+    else:
+        raise StartupIdentityError("M3_ARTIFACT_MANIFEST kind is unsupported")
+    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    if raw != canonical:
+        raise StartupIdentityError("M3_ARTIFACT_MANIFEST is not canonical JSON")
+    artifact_id = value.get("artifact_id")
+    if not isinstance(artifact_id, str) or not re.fullmatch(r"[0-9a-f]{32}", artifact_id):
+        raise StartupIdentityError("M3_ARTIFACT_MANIFEST artifact_id is missing or malformed")
+    binding_path = binding.get("path") if isinstance(binding, dict) else None
+    binding_realpath = _canonical_realpath(binding_path, binding_field)
+    if binding_realpath != model_realpath:
+        raise StartupIdentityError(
+            "artifact model path does not match M3_MODEL_DIR: %s != %s" %
+            (binding_realpath, model_realpath))
+    return kind, artifact_id, hashlib.sha256(raw).hexdigest()
+
+
+def _build_startup_identity(model_dir, manifest_path=None, *, pid=None,
+                            started_unix=None, startup_nonce=None):
+    """Construct the immutable identity exposed for this server process."""
+    model_realpath = _canonical_realpath(model_dir, "M3_MODEL_DIR")
+    if pid is None:
+        pid = os.getpid()
+    if started_unix is None:
+        started_unix = int(time.time())
+    if startup_nonce is None:
+        startup_nonce = os.urandom(16).hex()
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise StartupIdentityError("server PID is invalid")
+    if not isinstance(started_unix, int) or isinstance(started_unix, bool) or started_unix <= 0:
+        raise StartupIdentityError("server start time is invalid")
+    if not isinstance(startup_nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", startup_nonce):
+        raise StartupIdentityError("server startup nonce is invalid")
+    binding_kind = artifact_id = artifact_sha256 = None
+    if manifest_path is not None:  # an explicitly empty env value fails closed
+        binding_kind, artifact_id, artifact_sha256 = _artifact_identity(
+            manifest_path, model_realpath)
+    return {
+        "startup_nonce": startup_nonce,
+        "pid": pid,
+        "started_unix": started_unix,
+        "model_realpath": model_realpath,
+        "binding_kind": binding_kind,
+        "artifact_id": artifact_id,
+        "artifact_manifest_sha256": artifact_sha256,
+    }
+
 # Default = original prod weights (the instant-rollback target). PROD may override the served
 # weights via M3_MODEL_DIR in the launchd plist (2026-06-23 retune cutover): set it to repoint
 # :8082, unset/revert to roll back to MiniMax-M3-8bit. MODEL_ID stays "minimax-m3" so the
@@ -70,6 +188,12 @@ MD = os.path.realpath(os.path.expanduser(
     os.environ.get("M3_MODEL_DIR", "~/models/MiniMax-M3-8bit")))
 MODEL_ID = "minimax-m3"
 PORT = int(os.environ.get("M3_PORT", "8085"))  # nightly eval: 8085; PROD sets M3_PORT=8082
+_ARTIFACT_MANIFEST = (os.environ.get("M3_ARTIFACT_MANIFEST")
+                      if "M3_ARTIFACT_MANIFEST" in os.environ else None)
+# Build once, before a socket is bound or READY can become true. Any configured
+# receipt error therefore terminates startup rather than serving an unbound model.
+SERVER_IDENTITY = _build_startup_identity(MD, _ARTIFACT_MANIFEST)
+_RUNTIME_RECEIPT_OUT = None
 
 # WEDGE FIX (2026-06-22): bind the listening socket BEFORE loading the 256GB of weights, so the
 # port LISTENs in milliseconds and the watchdog can always see a live socket. Real inference is
@@ -145,6 +269,8 @@ if PREFIX_CACHE:
 # prompt is ~50 blocks, reused every call). APC has its own RAM guards + optional disk spill.
 M3_APC = os.environ.get("M3_APC", "0") != "0"
 APC = None
+_apc_blocks = 0
+_apc_disk_dir = None
 if M3_APC:
     from mlx_vlm import apc as _apc_mod
     # [audit C3] default 1024 -> 4096 blocks (~65K tokens). 1024 (16K tok) could NOT hold Alfred's
@@ -899,8 +1025,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/metrics"):   # #5: Prometheus text exposition
             self._send(200, _metrics_text(), ctype="text/plain; version=0.0.4")
         elif self.path.startswith("/v1/models") or self.path.startswith("/health"):
-            body = json.dumps({"object": "list", "ready": READY,
-                               "data": [{"id": MODEL_ID, "object": "model", "owned_by": "local"}]}).encode()
+            body = json.dumps(_health_payload()).encode()
             self._send(200, body)
         else:
             self._send(200, b"ready" if READY else b"loading", ctype="text/plain")
@@ -1217,6 +1342,194 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 
+def _health_payload():
+    """Return a fresh response object while keeping process identity immutable."""
+    payload = {"object": "list", "ready": READY,
+               "data": [{"id": MODEL_ID, "object": "model", "owned_by": "local"}]}
+    payload.update(SERVER_IDENTITY)
+    return payload
+
+
+def _runtime_receipt_output():
+    """Validate and return the fresh owner-controlled runtime receipt path."""
+    if _ARTIFACT_MANIFEST is None:
+        return None
+    configured = os.environ.get("M3_RUNTIME_RECEIPT", "")
+    if configured:
+        basename = os.path.basename(configured)
+        if not os.path.isabs(configured) or os.path.normpath(configured) != configured \
+                or not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", basename):
+            raise StartupIdentityError("M3_RUNTIME_RECEIPT must be a safe absolute path")
+        parent = _canonical_realpath(os.path.dirname(configured),
+                                     "M3_RUNTIME_RECEIPT parent")
+        out = os.path.join(parent, basename)
+    else:
+        parent = _canonical_realpath(os.environ.get("M3_RUNTIME_RECEIPT_DIR", ""),
+                                     "M3_RUNTIME_RECEIPT_DIR")
+        out = os.path.join(parent, "runtime.M3.%d.%d.%s.json" % (
+            SERVER_IDENTITY["started_unix"], SERVER_IDENTITY["pid"],
+            SERVER_IDENTITY["startup_nonce"]))
+    info = os.stat(parent)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise StartupIdentityError("runtime receipt directory must be owner-controlled")
+    if not out or os.path.lexists(out):
+        raise StartupIdentityError("M3_RUNTIME_RECEIPT must name a fresh file")
+    return out
+
+
+def _prepare_runtime_identity():
+    """Fail before socket bind if the immutable receipt cannot be published safely."""
+    global _RUNTIME_RECEIPT_OUT
+    _RUNTIME_RECEIPT_OUT = _runtime_receipt_output()
+
+
+def _json_safe_runtime(value):
+    if value is None or type(value) in (str, bool, int):
+        return value
+    if type(value) is float:
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_runtime(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_runtime(item) for item in value]
+    return str(value)
+
+
+def _runtime_package_tree_sha256():
+    """Fingerprint the loaded mlx_vlm package source, including editable installs."""
+    try:
+        import mlx_vlm as package
+        root = os.path.dirname(os.path.realpath(package.__file__))
+        records = []
+        for current, dirnames, filenames in os.walk(root, topdown=True,
+                                                     followlinks=False):
+            retained_dirs = []
+            for name in sorted(dirnames):
+                path = os.path.join(current, name)
+                if os.path.islink(path) or not os.path.isdir(path):
+                    raise StartupIdentityError(
+                        "mlx_vlm package contains a symlink/special directory")
+                if name not in {"__pycache__", ".git"}:
+                    retained_dirs.append(name)
+            dirnames[:] = retained_dirs
+            for name in sorted(filenames):
+                if name.endswith((".pyc", ".pyo")):
+                    continue
+                path = os.path.join(current, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise StartupIdentityError("mlx_vlm package contains a symlink/special file")
+                digest = hashlib.sha256()
+                with open(path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                records.append({"path": os.path.relpath(path, root),
+                                "size": os.path.getsize(path),
+                                "sha256": digest.hexdigest()})
+        if not records:
+            raise StartupIdentityError("mlx_vlm package fingerprint is empty")
+        raw = (json.dumps(records, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+        return hashlib.sha256(raw).hexdigest()
+    except ImportError:
+        return None
+
+
+def _initialize_runtime_identity():
+    """Bind the loaded custom-Python runtime immediately before READY becomes true."""
+    global _RUNTIME_RECEIPT_OUT
+    if _ARTIFACT_MANIFEST is None:
+        return
+    if MODEL is None or PROC is None or CFG is None:
+        raise StartupIdentityError("runtime identity requires the realized loaded model")
+    out = _RUNTIME_RECEIPT_OUT or _runtime_receipt_output()
+    if not out or os.path.lexists(out):
+        raise StartupIdentityError("M3 runtime receipt destination changed before publication")
+    script_path = os.path.realpath(__file__)
+    with open(script_path, "rb") as stream:
+        script_sha = hashlib.sha256(stream.read()).hexdigest()
+    versions = {}
+    try:
+        import importlib.metadata as metadata
+        for package in ("mlx", "mlx-lm", "mlx-vlm"):
+            try: versions[package] = metadata.version(package)
+            except metadata.PackageNotFoundError: versions[package] = None
+    except Exception:
+        versions = {"mlx": None, "mlx-lm": None, "mlx-vlm": None}
+    batch_core_path = os.path.join(os.path.dirname(script_path), "m3_batch_core.py")
+    with open(batch_core_path, "rb") as stream:
+        batch_core_sha = hashlib.sha256(stream.read()).hexdigest()
+    try:
+        default_device = str(mx.default_device())
+    except Exception:
+        default_device = None
+    try:
+        device_info = _json_safe_runtime(mx.metal.device_info())
+    except Exception:
+        device_info = None
+    contract = {
+        "schema": "pipeline-m3-runtime-contract.v1",
+        "backend": "custom-python-mlx",
+        "python": sys.version,
+        "packages": versions,
+        "shim_sha256": script_sha,
+        "batch_core_sha256": batch_core_sha,
+        "mlx_vlm_tree_sha256": _runtime_package_tree_sha256(),
+        "model_id": MODEL_ID,
+        "model_class": "%s.%s" % (type(MODEL).__module__, type(MODEL).__qualname__),
+        "processor_class": "%s.%s" % (type(PROC).__module__, type(PROC).__qualname__),
+        "config_class": "%s.%s" % (type(CFG).__module__, type(CFG).__qualname__),
+        "mlx_default_device": default_device,
+        "mlx_device_info": device_info,
+        "structured_decoder": bool(_STRUCTURED_OK),
+        "prefix_cache": bool(PREFIX_CACHE),
+        "apc": bool(M3_APC),
+        "apc_blocks": int(_apc_blocks),
+        "apc_disk": bool(_apc_disk_dir),
+        "batch_max": BATCH_MAX,
+        "batch_window_ms": BATCH_WINDOW_MS,
+        "batch_max_prompt_tokens": BATCH_MAX_PROMPT_TOK,
+        "max_pending": MAX_PENDING,
+        "lock_wait_seconds": LOCK_WAIT_S,
+        "prefill_step": PREFILL_STEP,
+        "max_generation_seconds": MAX_GEN_S,
+        "clear_cache_steps": CLEAR_CACHE_STEPS,
+        "max_tokens": M3_MAX_TOKENS,
+        "max_temperature": M3_MAX_TEMPERATURE,
+    }
+    contract_bytes = (json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    contract_sha = hashlib.sha256(contract_bytes).hexdigest()
+    receipt = {
+        "schema": "pipeline-m3-runtime.v1",
+        "contract": contract,
+        "contract_sha256": contract_sha,
+        "model_realpath": SERVER_IDENTITY["model_realpath"],
+        "model_id": MODEL_ID,
+        "binding_kind": SERVER_IDENTITY["binding_kind"],
+        "artifact_id": SERVER_IDENTITY["artifact_id"],
+        "artifact_manifest_sha256": SERVER_IDENTITY["artifact_manifest_sha256"],
+        "pid": SERVER_IDENTITY["pid"],
+        "started_unix": SERVER_IDENTITY["started_unix"],
+        "startup_nonce": SERVER_IDENTITY["startup_nonce"],
+    }
+    raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    parent = os.path.dirname(out)
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % os.path.basename(out), dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        os.link(tmp, out); os.unlink(tmp); tmp = ""
+        dfd = os.open(parent, os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        if tmp and os.path.exists(tmp): os.unlink(tmp)
+    SERVER_IDENTITY["runtime_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    SERVER_IDENTITY["runtime_contract_sha256"] = contract_sha
+    SERVER_IDENTITY["runtime_receipt"] = receipt
+
+
 def _load():
     """Load the 256GB of weights. On ANY failure hard-exit non-zero so launchd KeepAlive relaunches
     (instead of an OOM-killed-mid-load process leaving the port bound but the model absent)."""
@@ -1245,6 +1558,7 @@ def _load():
     except Exception as _we:
         print("warmup gen failed (non-fatal): %s" % _we, flush=True)
     threading.Thread(target=_batch_worker, daemon=True).start()
+    _initialize_runtime_identity()
     READY = True   # flip READY only after warmup + worker up
     print("batching worker: max=%d window=%dms eos=%s" % (BATCH_MAX, BATCH_WINDOW_MS, sorted(EOS_IDS)), flush=True)
     print("LOADED — serving 127.0.0.1:%d" % PORT, flush=True)
@@ -1254,6 +1568,7 @@ def main():
     """Bind the localhost server and load the model. Imports/tests never execute this path."""
     if _RUNTIME_IMPORT_ERROR is not None or generate_batch is None:
         raise RuntimeError("M3 serving runtime dependencies are unavailable") from _RUNTIME_IMPORT_ERROR
+    _prepare_runtime_identity()
     # Bind + start serving FIRST (port LISTENs in ms), THEN load the weights on the main thread.
     ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), H)

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import importlib.util
+import hashlib
 import io
+import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -233,6 +237,241 @@ class RouteTests(unittest.TestCase):
                     handler.do_POST()
                 self.assertEqual(400, handler._send.call_args.args[0])
                 generate_call.assert_not_called()
+
+
+class RuntimePackageTreeTests(unittest.TestCase):
+    def _package(self, root):
+        package_root = Path(root) / "mlx_vlm"
+        package_root.mkdir()
+        package_file = package_root / "__init__.py"
+        package_file.write_text("VERSION = 1\n", encoding="utf-8")
+        (package_root / "model.py").write_text("MODEL = 'one'\n", encoding="utf-8")
+        return package_root, SimpleNamespace(__file__=str(package_file))
+
+    def test_package_tree_fingerprint_is_content_bound_and_ignores_caches(self):
+        with tempfile.TemporaryDirectory() as td:
+            package_root, package = self._package(td)
+            with mock.patch.dict(sys.modules, {"mlx_vlm": package}):
+                first = SERVER._runtime_package_tree_sha256()
+                self.assertRegex(first, r"^[0-9a-f]{64}$")
+
+                cache = package_root / "__pycache__"
+                cache.mkdir()
+                (cache / "ignored.pyc").write_bytes(b"cache")
+                self.assertEqual(first, SERVER._runtime_package_tree_sha256())
+
+                (package_root / "model.py").write_text("MODEL = 'two'\n", encoding="utf-8")
+                self.assertNotEqual(first, SERVER._runtime_package_tree_sha256())
+
+    def test_package_tree_rejects_symlink_files_and_directories(self):
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
+                package_root, package = self._package(td)
+                target = Path(td) / ("target.py" if kind == "file" else "target-dir")
+                if kind == "file":
+                    target.write_text("outside = True\n", encoding="utf-8")
+                    (package_root / "linked.py").symlink_to(target)
+                else:
+                    target.mkdir()
+                    (package_root / "linked-dir").symlink_to(target, target_is_directory=True)
+                with mock.patch.dict(sys.modules, {"mlx_vlm": package}), \
+                        self.assertRaises(SERVER.StartupIdentityError):
+                    SERVER._runtime_package_tree_sha256()
+
+
+class StartupIdentityTests(unittest.TestCase):
+    def _manifest(self, root, candidate, value=None):
+        path = Path(root) / "artifact.json"
+        body = value if value is not None else {
+            "schema": 3, "kind": "pipeline-artifact", "artifact_type": "model-build",
+            "artifact_id": "0123456789abcdef0123456789abcdef", "created_unix": 1,
+            "label": "M3", "version": "v1", "candidate": {"path": str(candidate)},
+            "base": {}, "adapter": {}, "evidence": [], "metadata": {},
+        }
+        raw = (json.dumps(body, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True) + "\n").encode("ascii")
+        path.write_bytes(raw)
+        return path, raw
+
+    def test_malformed_manifest_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; model.mkdir()
+            manifest = Path(td) / "artifact.json"
+            for raw in (b"{bad", b"[]", b'{"candidate": {}}'):
+                with self.subTest(raw=raw):
+                    manifest.write_bytes(raw)
+                    with self.assertRaises(SERVER.StartupIdentityError):
+                        SERVER._build_startup_identity(str(model), str(manifest))
+
+    def test_wrong_candidate_path_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; other = Path(td) / "other"
+            model.mkdir(); other.mkdir()
+            manifest, _ = self._manifest(td, other)
+            with self.assertRaisesRegex(SERVER.StartupIdentityError,
+                                        "does not match M3_MODEL_DIR"):
+                SERVER._build_startup_identity(str(model), str(manifest))
+
+    def test_bad_configured_manifest_aborts_module_startup(self):
+        loader = (
+            "import importlib.util,sys; "
+            "s=importlib.util.spec_from_file_location('identity_fail',sys.argv[1]); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+        )
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; other = Path(td) / "other"
+            model.mkdir(); other.mkdir()
+            malformed = Path(td) / "malformed.json"
+            malformed.write_text("{bad", encoding="utf-8")
+            wrong, _ = self._manifest(td, other)
+            for manifest in (malformed, wrong):
+                with self.subTest(manifest=manifest.name):
+                    env = os.environ.copy()
+                    env.update({"M3_MODEL_DIR": str(model),
+                                "M3_ARTIFACT_MANIFEST": str(manifest),
+                                "M3_APC": "0", "M3_PREFIX_CACHE": "0"})
+                    proc = subprocess.run(
+                        [sys.executable, "-c", loader, str(HERE / "m3_serve_batched.py")],
+                        env=env, capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(0, proc.returncode)
+                    self.assertIn("StartupIdentityError", proc.stderr)
+
+    def test_valid_manifest_binds_raw_digest_and_stable_fields(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; model.mkdir()
+            manifest, raw = self._manifest(td, model)
+            identity = SERVER._build_startup_identity(
+                str(model), str(manifest), pid=123, started_unix=456,
+                startup_nonce="0123456789abcdef0123456789abcdef")
+            self.assertEqual("0123456789abcdef0123456789abcdef", identity["startup_nonce"])
+            self.assertEqual(123, identity["pid"])
+            self.assertEqual(456, identity["started_unix"])
+            self.assertEqual(str(model.resolve()), identity["model_realpath"])
+            self.assertEqual("0123456789abcdef0123456789abcdef", identity["artifact_id"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                             identity["artifact_manifest_sha256"])
+
+    def test_direction_artifact_schema_is_supported_but_strict(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; model.mkdir()
+            value = {
+                "schema": 4, "kind": "pipeline-artifact",
+                "artifact_type": "m3-abliteration-build",
+                "artifact_id": "0123456789abcdef0123456789abcdef",
+                "created_unix": 1, "label": "M3", "version": "abl-v1",
+                "candidate": {"path": str(model)}, "base": {},
+                "direction_bundle": {}, "recipe": {}, "direction_binding": {},
+                "evidence": [], "metadata": {},
+            }
+            manifest, raw = self._manifest(td, model, value)
+            identity = SERVER._build_startup_identity(
+                str(model), str(manifest), pid=123, started_unix=456,
+                startup_nonce="0123456789abcdef0123456789abcdef")
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                             identity["artifact_manifest_sha256"])
+            value["artifact_type"] = "model-build"
+            manifest.write_bytes((json.dumps(
+                value, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            with self.assertRaises(SERVER.StartupIdentityError):
+                SERVER._build_startup_identity(str(model), str(manifest))
+
+    def test_unconfigured_manifest_preserves_identity_with_null_artifact(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            model = Path(td) / "model"; model.mkdir()
+            identity = SERVER._build_startup_identity(
+                str(model), pid=2, started_unix=2,
+                startup_nonce="0123456789abcdef0123456789abcdef")
+            self.assertIsNone(identity["artifact_id"])
+            self.assertIsNone(identity["artifact_manifest_sha256"])
+
+    def test_runtime_receipt_is_create_only_and_health_bound(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            root = Path(td); model = root / "model"; model.mkdir()
+            runtime = root / "runtime"; runtime.mkdir(mode=0o700)
+            manifest, _raw = self._manifest(td, model)
+            identity = SERVER._build_startup_identity(
+                str(model), str(manifest), pid=os.getpid(), started_unix=456,
+                startup_nonce="0123456789abcdef0123456789abcdef")
+            old = SERVER.SERVER_IDENTITY
+            old_runtime_out = SERVER._RUNTIME_RECEIPT_OUT
+            old_loaded = (SERVER.MODEL, SERVER.PROC, SERVER.CFG)
+            try:
+                SERVER.SERVER_IDENTITY = identity
+                SERVER._RUNTIME_RECEIPT_OUT = None
+                SERVER.MODEL, SERVER.PROC, SERVER.CFG = object(), object(), object()
+                with mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
+                        mock.patch.dict(os.environ,
+                                        {"M3_RUNTIME_RECEIPT_DIR": str(runtime)}, clear=False):
+                    SERVER._initialize_runtime_identity()
+                self.assertRegex(identity["runtime_receipt_sha256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(identity["runtime_contract_sha256"], r"^[0-9a-f]{64}$")
+                receipts = list(runtime.glob("runtime.M3.*.json"))
+                self.assertEqual(1, len(receipts))
+                self.assertEqual(identity["runtime_receipt_sha256"],
+                                 hashlib.sha256(receipts[0].read_bytes()).hexdigest())
+                receipt = json.loads(receipts[0].read_text())
+                self.assertEqual(receipt, identity["runtime_receipt"])
+                contract_raw = (json.dumps(receipt["contract"], sort_keys=True,
+                                           separators=(",", ":"), ensure_ascii=True,
+                                           allow_nan=False) + "\n").encode("ascii")
+                self.assertEqual(receipt["contract_sha256"],
+                                 hashlib.sha256(contract_raw).hexdigest())
+                with mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
+                        mock.patch.dict(os.environ,
+                                        {"M3_RUNTIME_RECEIPT_DIR": str(runtime)}, clear=False), \
+                        self.assertRaises(SERVER.StartupIdentityError):
+                    SERVER._initialize_runtime_identity()
+            finally:
+                SERVER.SERVER_IDENTITY = old
+                SERVER._RUNTIME_RECEIPT_OUT = old_runtime_out
+                SERVER.MODEL, SERVER.PROC, SERVER.CFG = old_loaded
+
+    def test_runtime_receipt_parent_must_be_owner_controlled(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as td:
+            root = Path(td); model = root / "model"; model.mkdir()
+            unsafe = root / "unsafe"; unsafe.mkdir(mode=0o777); unsafe.chmod(0o777)
+            manifest, _raw = self._manifest(td, model)
+            identity = SERVER._build_startup_identity(
+                str(model), str(manifest), pid=os.getpid(), started_unix=456,
+                startup_nonce="0123456789abcdef0123456789abcdef")
+            old = SERVER.SERVER_IDENTITY
+            try:
+                SERVER.SERVER_IDENTITY = identity
+                with mock.patch.object(SERVER, "_ARTIFACT_MANIFEST", str(manifest)), \
+                        mock.patch.dict(os.environ,
+                                        {"M3_RUNTIME_RECEIPT": str(unsafe / "r.json")},
+                                        clear=False), \
+                        self.assertRaisesRegex(SERVER.StartupIdentityError,
+                                                "owner-controlled"):
+                    SERVER._runtime_receipt_output()
+            finally:
+                SERVER.SERVER_IDENTITY = old
+
+    def test_health_and_models_preserve_contract_and_stable_identity(self):
+        identity_keys = tuple(SERVER.SERVER_IDENTITY)
+        with mock.patch.object(SERVER, "READY", False):
+            loading = SERVER._health_payload()
+        with mock.patch.object(SERVER, "READY", True):
+            ready = SERVER._health_payload()
+        self.assertFalse(loading["ready"])
+        self.assertTrue(ready["ready"])
+        self.assertEqual("list", ready["object"])
+        self.assertEqual(SERVER.MODEL_ID, ready["data"][0]["id"])
+        for key in identity_keys:
+            self.assertEqual(loading[key], ready[key])
+
+        for route in ("/health", "/v1/models"):
+            with self.subTest(route=route):
+                handler = object.__new__(SERVER.H)
+                handler.path = route
+                handler._send = mock.Mock()
+                with mock.patch.object(SERVER, "READY", True):
+                    handler.do_GET()
+                status, body = handler._send.call_args.args[:2]
+                payload = json.loads(body)
+                self.assertEqual(200, status)
+                for key, value in SERVER.SERVER_IDENTITY.items():
+                    self.assertEqual(value, payload[key])
 
 
 class RedactionTests(unittest.TestCase):

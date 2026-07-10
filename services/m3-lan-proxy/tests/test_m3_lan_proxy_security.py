@@ -230,7 +230,14 @@ class _OfflineUpstreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"4\r\nbeta\r\n0\r\n\r\n")
             self.wfile.flush()
             return
-        payload = json.dumps({"ready": True, "path": self.path}).encode("utf-8")
+        if self.path == "/health":
+            payload = json.dumps({
+                "ready": True, "model_id": "minimax-m3",
+                "model_realpath": "/private/models/secret",
+                "runtime_receipt": {"device": "secret-device"},
+            }).encode("utf-8")
+        else:
+            payload = json.dumps({"ready": True, "path": self.path}).encode("utf-8")
         self._normal_response(payload)
 
     def do_POST(self) -> None:
@@ -339,7 +346,13 @@ class ProxyIntegrationTests(unittest.TestCase):
             with self.subTest(path=path):
                 status, _headers, body = self._request("GET", path)
                 self.assertEqual(200, status)
-                self.assertEqual(path, json.loads(body)["path"])
+                value = json.loads(body)
+                if path == "/health":
+                    self.assertEqual({"ready": True, "model": "minimax-m3"}, value)
+                    self.assertNotIn(b"private", body)
+                    self.assertNotIn(b"secret-device", body)
+                else:
+                    self.assertEqual(path, value["path"])
 
         body = b'{"messages":[{"role":"user","content":"hello"}]}'
         status, _headers, response_body = self._request(
@@ -449,7 +462,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         started = time.monotonic()
         try:
             client.sendall(
-                b"GET /health HTTP/1.1\r\n"
+                b"GET /v1/models HTTP/1.1\r\n"
                 + f"Host: {self.proxy_host}:{self.proxy_port}\r\n".encode()
                 + b"X-Slow:"
             )
@@ -569,7 +582,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         client.settimeout(2)
         try:
             client.sendall(
-                b"GET /health HTTP/1.1\r\n"
+                b"GET /v1/models HTTP/1.1\r\n"
                 + f"Host: {self.proxy_host}:{self.proxy_port}\r\n".encode()
                 + b"Accept: application/x-test-chunked\r\n\r\n"
             )
@@ -608,7 +621,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertNotIn(str(self.upstream.server_address).encode(), body)
 
         status, headers, _body = self._request(
-            "GET", "/health", headers={"Accept": "application/x-test-redirect"}
+            "GET", "/v1/models", headers={"Accept": "application/x-test-redirect"}
         )
         self.assertEqual(302, status)
         self.assertIn(

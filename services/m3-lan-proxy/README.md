@@ -6,7 +6,8 @@ Security properties:
 
 - The upstream must be loopback-only and may not contain URL credentials.
 - `POST /v1/chat/completions` requires a bearer token loaded from an owner-only regular file.
-- Readiness and model discovery are limited to `GET /`, `GET /health`, and `GET /v1/models`.
+- Readiness and model discovery are limited to `GET /`, `GET /health`, and `GET /v1/models`;
+  LAN health is reduced to `ready` and `model` so runtime paths, devices, and receipts stay local.
 - Request framing, body size, methods, paths, and timeouts are fail-closed.
 - Caller authorization, priority, and hop-by-hop headers are never forwarded upstream.
 - Upstream hop-by-hop headers are stripped, and chunked responses are safely reframed while streaming.

@@ -4,7 +4,7 @@
 The live proxy's useful contract is intentionally small:
 
 * listen on ``0.0.0.0:8096``;
-* forward health/model discovery GETs to ``127.0.0.1:8082``;
+* expose redacted health and forward model discovery GETs to ``127.0.0.1:8082``;
 * forward OpenAI-compatible chat-completion POSTs; and
 * stream the upstream response without buffering it in memory.
 
@@ -47,6 +47,7 @@ MAX_REQUEST_LINE_BYTES = 8192
 MAX_HEADER_LINE_BYTES = 8192
 MAX_HEADER_BYTES = 64 * 1024
 MAX_HEADER_COUNT = 100
+MAX_PUBLIC_HEALTH_BYTES = 64 * 1024
 
 GET_PATHS = frozenset({"/", "/health", "/v1/models"})
 POST_PATHS = frozenset({"/v1/chat/completions"})
@@ -765,6 +766,63 @@ class M3LanProxyHandler(BaseHTTPRequestHandler):
         finally:
             connection.close()
 
+    def _open_redacted_health(self) -> None:
+        """Probe detailed loopback health but return only LAN-safe readiness."""
+        headers = self._forwarded_request_headers()
+        if headers is None:
+            return
+        parsed = urlsplit(self.config.upstream)
+        connection_class = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        connection = connection_class(
+            parsed.hostname, parsed.port,
+            timeout=self.config.upstream_timeout_seconds,
+        )
+        upstream = None
+        try:
+            connection.request("GET", "/health", headers=headers)
+            upstream = connection.getresponse()
+            status = int(getattr(upstream, "status", None) or upstream.code)
+            mode, length = _upstream_transfer_mode(upstream.headers)
+            if status != HTTPStatus.OK or length is not None \
+                    and length > MAX_PUBLIC_HEALTH_BYTES:
+                raise UpstreamFramingError("health response is not usable")
+            raw = upstream.read(MAX_PUBLIC_HEALTH_BYTES + 1)
+            if len(raw) > MAX_PUBLIC_HEALTH_BYTES:
+                raise UpstreamFramingError("health response is too large")
+            if (mode == "length" and len(raw) != length) or upstream.read(1):
+                raise UpstreamFramingError("health response framing is invalid")
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict) or type(value.get("ready")) is not bool:
+                raise UpstreamFramingError("health response schema is invalid")
+            public = {"ready": value["ready"]}
+            model = value.get("model_id")
+            if isinstance(model, str) and model and len(model) <= 200:
+                public["model"] = model
+            payload = json.dumps(public, separators=(",", ":")).encode("utf-8")
+            self.close_connection = True
+            self.send_response(HTTPStatus.OK if value["ready"] else HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (AttributeError, HeaderSyntaxError, OSError, TypeError, ValueError,
+                UnicodeDecodeError, json.JSONDecodeError, UpstreamFramingError):
+            self._send_json_error(HTTPStatus.BAD_GATEWAY, "upstream unavailable")
+        finally:
+            try:
+                if upstream is not None:
+                    upstream.close()
+            except (AttributeError, OSError):
+                pass
+            connection.close()
+
     def _relay_upstream(self, upstream) -> None:
         try:
             try:
@@ -857,7 +915,10 @@ class M3LanProxyHandler(BaseHTTPRequestHandler):
         target = self._target(GET_PATHS)
         if target is None or not self._validate_bodyless_get():
             return
-        self._open_upstream("GET", target, None)
+        if target == "/health":
+            self._open_redacted_health()
+        else:
+            self._open_upstream("GET", target, None)
 
     def do_POST(self) -> None:
         target = self._target(POST_PATHS)

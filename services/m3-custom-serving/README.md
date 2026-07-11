@@ -55,6 +55,7 @@ python3.12 -m venv .venv
 pip install -r requirements-apple-silicon.txt
 
 M3_MODEL_DIR=~/models/MiniMax-M3-6bit-v1-hotpath-abl \
+M3_ARTIFACT_MANIFEST=~/.local/share/m3-serving/production-artifact.json \
 M3_PORT=8082 \
 M3_APC=1 \
 M3_APC_BLOCKS=4096 \
@@ -63,6 +64,12 @@ M3_RUNTIME_RECEIPT_DIR=/absolute/owner-only/runtime-receipts \
 PYTHONPATH="$PWD:$PWD/vendor/mlx-vlm" \
 python m3_serve_batched.py
 ```
+
+`M3_ARTIFACT_MANIFEST` is mandatory. It must be a canonical, immutable
+pipeline artifact/reference receipt whose bound model path exactly equals
+`M3_MODEL_DIR`; an empty value, a placeholder, or a receipt for another model
+fails before the server binds. The old manifest-free launch example is invalid
+and must not be used for production or benchmarking.
 
 The pinned `mlx-vlm` fork provides MiniMax M3 support, the batch KV-cache API,
 and structured decoding used here. Keep the server and fork revisions locked
@@ -73,6 +80,7 @@ Important environment controls:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `M3_MODEL_DIR` | `~/models/MiniMax-M3-8bit` | Model directory |
+| `M3_ARTIFACT_MANIFEST` | none; required | Canonical receipt binding the exact model artifact |
 | `M3_PORT` | `8085` | Loopback port |
 | `M3_MAX_BODY_BYTES` | `20971520` | Request-body cap |
 | `M3_MAX_IMG_BYTES` | `12582912` | Decoded image cap |

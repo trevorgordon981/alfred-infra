@@ -649,10 +649,13 @@ class MachineResourceLeaseTests(unittest.TestCase):
             try:
                 with mock.patch.dict(os.environ, {"M3_MACHINE_RESOURCE_LOCK": str(lock)}, clear=False):
                     path = SERVER._acquire_machine_resource()
+                    token = SERVER._MACHINE_RESOURCE_TOKEN
                     self.assertTrue(lock.is_dir())
                     with self.assertRaises(SERVER.StartupIdentityError):
                         SERVER._acquire_machine_resource()
                     SERVER._release_machine_resource(path)
+                    self.assertTrue(lock.is_dir())
+                    SERVER._machine_resource_module().release(path, token)
                     self.assertFalse(lock.exists())
             finally:
                 SERVER._MACHINE_RESOURCE_TOKEN = old_token

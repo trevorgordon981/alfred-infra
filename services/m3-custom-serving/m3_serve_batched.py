@@ -16,6 +16,20 @@ class StartupIdentityError(RuntimeError):
     """The configured model/runtime cannot be bound to its provenance receipt."""
 
 
+class _ServingSignal(BaseException):
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _ServingFatal(BaseException):
+    pass
+
+
+class ProfileAuthorizationError(RuntimeError):
+    """An explicit request tried to select an unavailable or unauthorized profile."""
+
+
 def _runtime_stat(info):
     return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
             stat.S_IMODE(info.st_mode), info.st_size, info.st_mtime_ns,
@@ -275,6 +289,115 @@ def _strict_json_object(pairs):
     return value
 
 
+_FIXED_LORA_PROFILES = {"general": 0.0, "trader": 1.0}
+_LORA_PROFILE_SCHEMA = "m3-lora-profiles.v1"
+_LORA_PROFILE_ENV_KEYS = (
+    "M3_LORA_ADAPTER_DIR",
+    "M3_LORA_PROFILE_CONFIG",
+    "M3_LORA_PROFILE_TOKEN_FILE",
+)
+
+
+def _stable_file_sha256(path, label, *, expected_size=None):
+    """Hash one owner-controlled regular file and return its stable identity."""
+    path = _canonical_realpath(path, label)
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() \
+                or stat.S_IMODE(before.st_mode) & 0o022:
+            raise StartupIdentityError("%s must be an owner-controlled regular file" % label)
+        if expected_size is not None and before.st_size != expected_size:
+            raise StartupIdentityError("%s size does not match its profile receipt" % label)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
+            | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if _runtime_stat(opened) != _runtime_stat(before):
+                raise StartupIdentityError("%s changed while opening" % label)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        final = os.lstat(path)
+    except StartupIdentityError:
+        raise
+    except OSError as exc:
+        raise StartupIdentityError("cannot hash %s" % label) from exc
+    if _runtime_stat(after) != _runtime_stat(opened) \
+            or _runtime_stat(final) != _runtime_stat(opened):
+        raise StartupIdentityError("%s changed while hashing" % label)
+    identity = {
+        "path": path, "device": opened.st_dev, "inode": opened.st_ino,
+        "mode": stat.S_IMODE(opened.st_mode), "size": opened.st_size,
+        "mtime_ns": opened.st_mtime_ns, "ctime_ns": opened.st_ctime_ns,
+    }
+    return digest.hexdigest(), identity
+
+
+def _load_lora_profile_config(path):
+    """Load the immutable two-profile receipt without importing serving dependencies."""
+    config_path = _canonical_realpath(path, "M3_LORA_PROFILE_CONFIG")
+    try:
+        info = os.lstat(config_path)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() \
+                or stat.S_IMODE(info.st_mode) & 0o022 or info.st_size > 64 * 1024:
+            raise StartupIdentityError(
+                "M3_LORA_PROFILE_CONFIG must be a small owner-controlled file")
+        with open(config_path, "rb") as stream:
+            raw = stream.read(64 * 1024 + 1)
+    except StartupIdentityError:
+        raise
+    except OSError as exc:
+        raise StartupIdentityError("cannot read M3_LORA_PROFILE_CONFIG") from exc
+    if len(raw) > 64 * 1024:
+        raise StartupIdentityError("M3_LORA_PROFILE_CONFIG is too large")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_strict_json_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                StartupIdentityError("non-finite LoRA profile value: %s" % token)))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StartupIdentityError("M3_LORA_PROFILE_CONFIG is not valid JSON") from exc
+    expected_keys = {"schema", "adapter", "default_profile", "profiles"}
+    if not isinstance(value, dict) or set(value) != expected_keys \
+            or value.get("schema") != _LORA_PROFILE_SCHEMA \
+            or value.get("default_profile") != "general" \
+            or value.get("profiles") != _FIXED_LORA_PROFILES:
+        raise StartupIdentityError(
+            "LoRA profile receipt must define exactly general=0 and trader=1")
+    adapter = value.get("adapter")
+    adapter_keys = {"path", "config_sha256", "weights_sha256", "weights_bytes"}
+    if not isinstance(adapter, dict) or set(adapter) != adapter_keys:
+        raise StartupIdentityError("LoRA adapter receipt is malformed")
+    adapter_path = _canonical_realpath(adapter.get("path"), "LoRA adapter path")
+    if not os.path.isdir(adapter_path):
+        raise StartupIdentityError("LoRA adapter path is not a directory")
+    for key in ("config_sha256", "weights_sha256"):
+        if not isinstance(adapter.get(key), str) \
+                or not re.fullmatch(r"[0-9a-f]{64}", adapter[key]):
+            raise StartupIdentityError("LoRA adapter %s is malformed" % key)
+    if type(adapter.get("weights_bytes")) is not int or adapter["weights_bytes"] <= 0:
+        raise StartupIdentityError("LoRA adapter weights_bytes is malformed")
+    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    if raw != canonical:
+        raise StartupIdentityError("M3_LORA_PROFILE_CONFIG is not canonical JSON")
+    return {
+        "path": config_path,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "adapter": dict(adapter, path=adapter_path),
+        "default_profile": "general",
+        "profiles": dict(_FIXED_LORA_PROFILES),
+    }
+
+
 def _artifact_identity(manifest_path, model_realpath):
     """Read and bind one pipeline artifact manifest without third-party dependencies.
 
@@ -380,12 +503,107 @@ MODEL_ID = "minimax-m3"
 PORT = int(os.environ.get("M3_PORT", "8085"))  # nightly eval: 8085; PROD sets M3_PORT=8082
 _ARTIFACT_MANIFEST = (os.environ.get("M3_ARTIFACT_MANIFEST")
                       if "M3_ARTIFACT_MANIFEST" in os.environ else None)
+_lora_flag = os.environ.get("M3_LORA_PROFILES", "0")
+if _lora_flag not in ("0", "1"):
+    raise StartupIdentityError("M3_LORA_PROFILES must be exactly 0 or 1")
+LORA_PROFILES_ENABLED = _lora_flag == "1"
+LORA_PROFILE_CONFIG = None
+LORA_ADAPTER_DIR = None
+LORA_PROFILE_TOKEN_FILE = ""
+if LORA_PROFILES_ENABLED:
+    missing = [name for name in _LORA_PROFILE_ENV_KEYS if not os.environ.get(name)]
+    if missing:
+        raise StartupIdentityError(
+            "LoRA profiles require %s" % ", ".join(sorted(missing)))
+    LORA_PROFILE_CONFIG = _load_lora_profile_config(
+        os.environ["M3_LORA_PROFILE_CONFIG"])
+    LORA_ADAPTER_DIR = _canonical_realpath(
+        os.environ["M3_LORA_ADAPTER_DIR"], "M3_LORA_ADAPTER_DIR")
+    LORA_PROFILE_TOKEN_FILE = _canonical_realpath(
+        os.environ["M3_LORA_PROFILE_TOKEN_FILE"],
+        "M3_LORA_PROFILE_TOKEN_FILE")
+    if LORA_ADAPTER_DIR != LORA_PROFILE_CONFIG["adapter"]["path"]:
+        raise StartupIdentityError(
+            "M3_LORA_ADAPTER_DIR does not match its profile receipt")
+LORA_DEFAULT_PROFILE = "general" if LORA_PROFILES_ENABLED else "fused"
+LORA_PROFILE_CONFIG_SHA256 = (
+    LORA_PROFILE_CONFIG["sha256"] if LORA_PROFILE_CONFIG else None)
+LORA_PROFILE_CACHE_TENANTS = {
+    name: "m3-lora:%s:%s:%s" % (
+        LORA_PROFILE_CONFIG_SHA256, name, _FIXED_LORA_PROFILES[name])
+    for name in _FIXED_LORA_PROFILES
+} if LORA_PROFILES_ENABLED else {}
 # Build once, before a socket is bound or READY can become true. Any configured
 # receipt error therefore terminates startup rather than serving an unbound model.
 SERVER_IDENTITY = _build_startup_identity(MD, _ARTIFACT_MANIFEST)
+SERVER_IDENTITY.update({
+    "lora_profiles_enabled": LORA_PROFILES_ENABLED,
+    "lora_default_profile": LORA_DEFAULT_PROFILE,
+    "lora_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256,
+    "lora_adapter_realpath": LORA_ADAPTER_DIR,
+})
 _RUNTIME_RECEIPT_OUT = None
 _MACHINE_RESOURCE_TOKEN = None
 _MACHINE_RESOURCE_OWNED = False
+_MACHINE_RESOURCE_SUCCESSOR = False
+_MACHINE_RESOURCE_PATH = None
+_FATAL_LIFECYCLE = None
+_FATAL_EVENT = threading.Event()
+_LORA_ADAPTER_STABILITY = None
+_LORA_LAYERS = []
+
+
+def _verify_lora_adapter_binding():
+    """Hash the exact adapter under the machine lease before any socket/model load."""
+    global _LORA_ADAPTER_STABILITY
+    if not LORA_PROFILES_ENABLED:
+        _LORA_ADAPTER_STABILITY = None
+        return None
+    adapter = LORA_PROFILE_CONFIG["adapter"]
+    profile_sha, profile_identity = _stable_file_sha256(
+        LORA_PROFILE_CONFIG["path"], "LoRA profile receipt",
+        expected_size=LORA_PROFILE_CONFIG["size"])
+    if profile_sha != LORA_PROFILE_CONFIG["sha256"]:
+        raise StartupIdentityError("LoRA profile receipt changed before model load")
+    config_path = os.path.join(LORA_ADAPTER_DIR, "adapter_config.json")
+    weights_path = os.path.join(LORA_ADAPTER_DIR, "adapters.safetensors")
+    config_sha, config_identity = _stable_file_sha256(
+        config_path, "LoRA adapter config")
+    weights_sha, weights_identity = _stable_file_sha256(
+        weights_path, "LoRA adapter weights",
+        expected_size=adapter["weights_bytes"])
+    if config_sha != adapter["config_sha256"] \
+            or weights_sha != adapter["weights_sha256"]:
+        raise StartupIdentityError("LoRA adapter differs from its profile receipt")
+    _LORA_ADAPTER_STABILITY = {
+        "profile_receipt": profile_identity,
+        "config": config_identity, "weights": weights_identity,
+        "config_sha256": config_sha, "weights_sha256": weights_sha,
+    }
+    SERVER_IDENTITY["lora_adapter_config_sha256"] = config_sha
+    SERVER_IDENTITY["lora_adapter_weights_sha256"] = weights_sha
+    SERVER_IDENTITY["lora_adapter_weights_bytes"] = weights_identity["size"]
+    return _LORA_ADAPTER_STABILITY
+
+
+def _reprove_lora_adapter_stability():
+    """Cheap post-load check that the already-hashed adapter was not swapped."""
+    if not LORA_PROFILES_ENABLED or not isinstance(_LORA_ADAPTER_STABILITY, dict):
+        return
+    for label, item in (("profile receipt", _LORA_ADAPTER_STABILITY["profile_receipt"]),
+                        ("config", _LORA_ADAPTER_STABILITY["config"]),
+                        ("weights", _LORA_ADAPTER_STABILITY["weights"])):
+        try:
+            current = os.lstat(item["path"])
+        except OSError as exc:
+            raise StartupIdentityError("LoRA adapter %s disappeared" % label) from exc
+        observed = {
+            "path": item["path"], "device": current.st_dev, "inode": current.st_ino,
+            "mode": stat.S_IMODE(current.st_mode), "size": current.st_size,
+            "mtime_ns": current.st_mtime_ns, "ctime_ns": current.st_ctime_ns,
+        }
+        if observed != item:
+            raise StartupIdentityError("LoRA adapter %s changed during model load" % label)
 
 
 def _machine_resource_module():
@@ -400,15 +618,32 @@ def _machine_resource_module():
     return module
 
 
+def _machine_resource_path():
+    generic = os.environ.get("MACHINE_RESOURCE_LOCK")
+    specific = os.environ.get("M3_MACHINE_RESOURCE_LOCK")
+    if generic and specific and generic != specific:
+        raise StartupIdentityError(
+            "machine resource lock names do not match")
+    configured = specific or generic or "~/.local/state/alfred-machine-resource.lock"
+    expanded = os.path.expanduser(configured)
+    if not os.path.isabs(expanded) or os.path.normpath(expanded) != expanded \
+            or os.path.realpath(expanded) != expanded:
+        raise StartupIdentityError(
+            "machine resource lock must be canonical and absolute")
+    return expanded
+
+
 def _acquire_machine_resource():
     """Acquire or re-prove the train/build/eval/serve machine-wide lease."""
     global _MACHINE_RESOURCE_TOKEN, _MACHINE_RESOURCE_OWNED
-    expanded = os.path.expanduser(os.environ.get(
-        "M3_MACHINE_RESOURCE_LOCK", "~/.local/state/alfred-machine-resource.lock"))
-    if not os.path.isabs(expanded) or os.path.normpath(expanded) != expanded \
-            or os.path.realpath(expanded) != expanded:
-        raise StartupIdentityError("M3_MACHINE_RESOURCE_LOCK must be canonical and absolute")
-    path = expanded
+    global _MACHINE_RESOURCE_SUCCESSOR
+    global _MACHINE_RESOURCE_PATH
+    if _MACHINE_RESOURCE_TOKEN is not None or _MACHINE_RESOURCE_OWNED \
+            or _MACHINE_RESOURCE_SUCCESSOR:
+        raise StartupIdentityError(
+            "machine resource lease is already acquired by this process")
+    path = _machine_resource_path()
+    _MACHINE_RESOURCE_PATH = path
     parent = os.path.dirname(path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     os.chmod(parent, 0o700)
@@ -416,12 +651,53 @@ def _acquire_machine_resource():
     inherited = os.environ.get("ALFRED_MACHINE_RESOURCE_TOKEN")
     try:
         if inherited:
-            lease.assert_owned(path, inherited)
+            lease.assert_participant(path, inherited)
             _MACHINE_RESOURCE_TOKEN = inherited
             _MACHINE_RESOURCE_OWNED = False
+            _MACHINE_RESOURCE_SUCCESSOR = False
         else:
-            _MACHINE_RESOURCE_TOKEN = lease.acquire(path, "custom Python M3 serving")
-            _MACHINE_RESOURCE_OWNED = True
+            def acquire_direct():
+                global _MACHINE_RESOURCE_TOKEN, _MACHINE_RESOURCE_OWNED
+                global _MACHINE_RESOURCE_SUCCESSOR
+                candidate = os.urandom(32).hex()
+                # Publish provisional ownership before the fallible acquire so
+                # a handled signal can retain any receipt already created.
+                _MACHINE_RESOURCE_TOKEN = candidate
+                _MACHINE_RESOURCE_OWNED = True
+                _MACHINE_RESOURCE_SUCCESSOR = False
+                lease.acquire(path, "custom Python M3 serving", candidate)
+
+            try:
+                acquire_direct()
+            except lease.LeaseError:
+                _MACHINE_RESOURCE_TOKEN = None
+                _MACHINE_RESOURCE_OWNED = False
+                # Direct serving intentionally leaves its receipt through
+                # process death. A new authorized instance may clear only a
+                # canonical lease whose owner/child/group/successor are dead.
+                try:
+                    recovered = lease.recover_dead_owner(path)
+                except lease.LeaseError:
+                    recovered = False
+                if recovered or not os.path.lexists(path):
+                    try:
+                        acquire_direct()
+                    except lease.LeaseError:
+                        _MACHINE_RESOURCE_TOKEN = None
+                        _MACHINE_RESOURCE_OWNED = False
+                    else:
+                        return path
+                timeout_text = os.environ.get(
+                    "M3_MACHINE_RESOURCE_HANDOFF_TIMEOUT", "180")
+                try:
+                    timeout = float(timeout_text)
+                except ValueError as exc:
+                    raise StartupIdentityError(
+                        "invalid machine resource handoff timeout") from exc
+                value = lease.await_successor(path, timeout)
+                _MACHINE_RESOURCE_TOKEN = value["token"]
+                _MACHINE_RESOURCE_OWNED = False
+                _MACHINE_RESOURCE_SUCCESSOR = True
     except lease.LeaseError as exc:
         raise StartupIdentityError("machine resource lease is unavailable") from exc
     return path
@@ -429,17 +705,29 @@ def _acquire_machine_resource():
 
 def _release_machine_resource(path):
     global _MACHINE_RESOURCE_TOKEN, _MACHINE_RESOURCE_OWNED
-    if _MACHINE_RESOURCE_OWNED and _MACHINE_RESOURCE_TOKEN:
-        lease = _machine_resource_module()
-        lease.release(path, _MACHINE_RESOURCE_TOKEN)
-    _MACHINE_RESOURCE_TOKEN = None
-    _MACHINE_RESOURCE_OWNED = False
+    global _MACHINE_RESOURCE_SUCCESSOR
+    global _MACHINE_RESOURCE_PATH
+    try:
+        if (_MACHINE_RESOURCE_OWNED or _MACHINE_RESOURCE_SUCCESSOR) \
+                and _MACHINE_RESOURCE_TOKEN:
+            lease = _machine_resource_module()
+            # Direct/transferred ownership remains recorded until this process
+            # is dead; a pending successor instead withdraws atomically. The
+            # next authorized launcher performs kernel-death recovery.
+            lease.retain_or_withdraw_successor(
+                path, _MACHINE_RESOURCE_TOKEN,
+                SERVER_IDENTITY.get("startup_nonce"))
+    finally:
+        _MACHINE_RESOURCE_TOKEN = None
+        _MACHINE_RESOURCE_OWNED = False
+        _MACHINE_RESOURCE_SUCCESSOR = False
+        _MACHINE_RESOURCE_PATH = None
 
 # WEDGE FIX (2026-06-22): bind the listening socket BEFORE loading the 256GB of weights, so the
 # port LISTENs in milliseconds and the watchdog can always see a live socket. Real inference is
-# gated behind READY (503 "loading" until the load finishes). If the load OOM-dies mid-flight we
-# os._exit(1) so launchd KeepAlive relaunches cleanly instead of leaving "weights resident, no
-# listener, process alive" — the un-healable wedge. MODEL/PROC/CFG are populated by _load() below.
+# gated behind READY (503 "loading" until the load finishes). Load/worker failure is routed back to
+# main so its lease/listener cleanup runs before launchd KeepAlive relaunches. MODEL/PROC/CFG are
+# populated by _load() below.
 READY = False
 MODEL = PROC = CFG = None
 
@@ -447,6 +735,73 @@ MODEL = PROC = CFG = None
 # trip a fallback) but GPU generation is serialized — the model/tokenizer are NOT
 # thread-safe, so only one generate() runs at a time; others queue on the lock.
 GEN_LOCK = threading.Lock()
+
+
+def _normalize_lora_profile(profile=None):
+    if not LORA_PROFILES_ENABLED:
+        if profile not in (None, "fused"):
+            raise ProfileAuthorizationError("LoRA profiles are disabled")
+        return "fused"
+    selected = LORA_DEFAULT_PROFILE if profile is None else profile
+    if selected not in _FIXED_LORA_PROFILES:
+        raise ProfileAuthorizationError("unknown LoRA profile")
+    return selected
+
+
+def _initialize_lora_layers(model):
+    """Discover the one loaded adapter and put it in the fail-safe general=0 state."""
+    global _LORA_LAYERS
+    if not LORA_PROFILES_ENABLED:
+        _LORA_LAYERS = []
+        return
+    layers = []
+    try:
+        modules = model.named_modules()
+    except Exception as exc:
+        raise StartupIdentityError("loaded model cannot enumerate LoRA layers") from exc
+    supported = {"LoRALinear", "LoRASwitchLinear", "LoRAEmbedding"}
+    for name, module in modules:
+        if type(module).__name__ not in supported:
+            continue
+        if not all(hasattr(module, field) for field in ("scale", "lora_a", "lora_b")):
+            raise StartupIdentityError("malformed LoRA layer: %s" % name)
+        scale = module.scale
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) \
+                or not math.isfinite(float(scale)) or float(scale) <= 0:
+            raise StartupIdentityError("invalid trained LoRA scale: %s" % name)
+        layers.append((name, module, float(scale)))
+    if not layers:
+        raise StartupIdentityError("profile mode loaded no supported LoRA layers")
+    _LORA_LAYERS = layers
+    for _name, layer, base_scale in _LORA_LAYERS:
+        layer.scale = base_scale * _FIXED_LORA_PROFILES[LORA_DEFAULT_PROFILE]
+
+
+@contextlib.contextmanager
+def _lora_profile_scope(profile=None):
+    """Select one fixed scale only while the caller owns the global generation lock."""
+    selected = _normalize_lora_profile(profile)
+    if not LORA_PROFILES_ENABLED:
+        yield selected
+        return
+    if not GEN_LOCK.locked():
+        raise RuntimeError("LoRA profile changes require GEN_LOCK")
+    if not _LORA_LAYERS:
+        raise RuntimeError("LoRA profile layers are not initialized")
+    strength = _FIXED_LORA_PROFILES[selected]
+    for _name, layer, base_scale in _LORA_LAYERS:
+        layer.scale = base_scale * strength
+    try:
+        yield selected
+    finally:
+        # MLX is lazy. Do not restore the process-global layer scales until every
+        # graph from this request is complete, even on cancellation/failure.
+        try:
+            mx.synchronize()
+        finally:
+            default_strength = _FIXED_LORA_PROFILES[LORA_DEFAULT_PROFILE]
+            for _name, layer, base_scale in _LORA_LAYERS:
+                layer.scale = base_scale * default_strength
 # QUEUE-NOT-SHED (2026-06-23): a request that cannot grab the GPU now WAITS its turn (FIFO on the
 # lock) instead of 503-ing after a short window. Default raised 45 -> 600s so the live trader and
 # the (thinking-on, multi-minute) daily slate QUEUE behind each other rather than collide into 503
@@ -534,6 +889,9 @@ if M3_APC:
     print("APC enabled: %d blocks x 16 tok (~%dK tok keyed prefix cache)" % (_apc_blocks, _apc_blocks * 16 // 1000), flush=True)
 # The generation path caches when EITHER mechanism is on.
 USE_CACHE = M3_APC or PREFIX_CACHE
+if LORA_PROFILES_ENABLED and PREFIX_CACHE:
+    raise StartupIdentityError(
+        "M3_PREFIX_CACHE cannot isolate KV state across LoRA profiles; use APC")
 
 
 class StructuredDecodingUnavailable(RuntimeError):
@@ -588,7 +946,8 @@ def _build_json_lp(response_format, think, explicit=None):
         raise StructuredDecodingUnavailable("structured decoding unavailable") from e
 
 
-def _gen(prompt, mt, temp, use_cache, images=None, cancel=None, logits_processors=None, stream_q=None):
+def _gen(prompt, mt, temp, use_cache, images=None, cancel=None, logits_processors=None,
+         stream_q=None, profile=None):
     """One generation. use_cache=True reuses the shared prefix cache; False = fresh cache.
     logits_processors (increment-1 #1): when set (constrained JSON), force the STREAMED path so the
     processor is applied per token, and skip the cache (a grammar-constrained decode must not reuse
@@ -614,6 +973,10 @@ def _gen(prompt, mt, temp, use_cache, images=None, cancel=None, logits_processor
                 _cache_kw = {"logits_processors": logits_processors}
             elif use_cache and APC is not None:  # APC (keyed, pollution-free) when enabled
                 _cache_kw = {"apc_manager": APC}
+                if LORA_PROFILES_ENABLED:
+                    selected = _normalize_lora_profile(profile)
+                    # KV computed under one adapter strength is invalid under another.
+                    _cache_kw["apc_tenant"] = LORA_PROFILE_CACHE_TENANTS[selected]
             elif use_cache:  # legacy single shared PCSTATE (off-by-default; H3)
                 _cache_kw = {"prompt_cache_state": PCSTATE}
             else:  # [inc3] streaming with no cache mechanism -> fresh decode (never re-arm PCSTATE)
@@ -684,7 +1047,8 @@ def _degenerate(out):
     return None
 
 
-def _run(q, mt, temp, think, tools, images=None, cancel=None, logits_processors=None, stream_q=None):
+def _run(q, mt, temp, think, tools, images=None, cancel=None, logits_processors=None,
+         stream_q=None, profile=None):
     """Apply chat template + generate. Sheds load (raises Busy) when the GPU is busy.
     EMPTY/LOOP GUARD: if the first generation is degenerate, retry ONCE with a fresh cache and a
     temperature bump to break the greedy failure path, so a blank/looping reply never reaches the
@@ -698,17 +1062,22 @@ def _run(q, mt, temp, think, tools, images=None, cancel=None, logits_processors=
     if not GEN_LOCK.acquire(timeout=LOCK_WAIT_S):
         raise Busy()
     try:
-        prompt = apply_chat_template(PROC, CFG, q, num_images=n_img, **kw)
-        out = _gen(prompt, mt, temp, USE_CACHE, images=images, cancel=cancel, logits_processors=logits_processors, stream_q=stream_q)  # [auditfix] #3/#4; [inc3] stream_q
-        bad = _degenerate(out)
-        # [inc3] NEVER retry a streaming job: its first-pass tokens were already pushed to the client
-        # (and the end-of-stream sentinel already sent), so a second _gen would double-emit / stream to
-        # a queue nobody drains. Streaming forgoes the empty/loop retry guard by design.
-        if bad and mt > 0 and stream_q is None and not (cancel is not None and cancel()):  # [auditfix] #4: no retry for a dead caller; #6: mt<=0 is legitimately empty
-            print("[guard] degenerate output (%s); retrying once (fresh cache, temp>=0.4)" % bad, flush=True)
-            out = _gen(prompt, mt, max(temp, 0.4), False, images=images, cancel=cancel, logits_processors=logits_processors)
-            if _degenerate(out):
-                print("[guard] retry still degenerate; returning as-is", flush=True)
+        with _lora_profile_scope(profile) as selected_profile:
+            prompt = apply_chat_template(PROC, CFG, q, num_images=n_img, **kw)
+            out = _gen(prompt, mt, temp, USE_CACHE, images=images, cancel=cancel,
+                       logits_processors=logits_processors, stream_q=stream_q,
+                       profile=selected_profile)
+            bad = _degenerate(out)
+            # [inc3] NEVER retry a streaming job: its first-pass tokens were already pushed to the client
+            # (and the end-of-stream sentinel already sent), so a second _gen would double-emit / stream to
+            # a queue nobody drains. Streaming forgoes the empty/loop retry guard by design.
+            if bad and mt > 0 and stream_q is None and not (cancel is not None and cancel()):  # [auditfix] #4: no retry for a dead caller; #6: mt<=0 is legitimately empty
+                print("[guard] degenerate output (%s); retrying once (fresh cache, temp>=0.4)" % bad, flush=True)
+                out = _gen(prompt, mt, max(temp, 0.4), False, images=images,
+                           cancel=cancel, logits_processors=logits_processors,
+                           profile=selected_profile)
+                if _degenerate(out):
+                    print("[guard] retry still degenerate; returning as-is", flush=True)
     finally:
         with contextlib.suppress(Exception):
             mx.clear_cache()  # [auditfix] #2: free the Metal buffer cache after every solo gen
@@ -925,7 +1294,9 @@ _METRICS = {"requests_total": 0, "busy_503_total": 0, "errors_total": 0, "gen_co
             "gen_seconds_sum": 0.0, "tokens_out_total": 0, "prompt_tokens_total": 0,
             "batched_gens_total": 0, "solo_gens_total": 0, "constrained_total": 0,
             "batch_rows_sum": 0, "batch_count": 0,
-            "p0_total": 0, "p1_total": 0, "p2_total": 0}  # [inc2] per-priority-class request counters
+            "p0_total": 0, "p1_total": 0, "p2_total": 0,
+            "profile_fused_total": 0, "profile_general_total": 0,
+            "profile_trader_total": 0}  # fixed-cardinality profile counters
 _METLOCK = threading.Lock()
 def _metric_add(**kw):
     with _METLOCK:
@@ -957,6 +1328,11 @@ def _metrics_text():
         "m3_p1_total %d" % m["p1_total"],
         "# HELP m3_p2_total priority-2 (bench) requests", "# TYPE m3_p2_total counter",
         "m3_p2_total %d" % m["p2_total"],
+        "# HELP m3_profile_requests_total admitted requests by fixed serving profile",
+        "# TYPE m3_profile_requests_total counter",
+        'm3_profile_requests_total{profile="fused"} %d' % m["profile_fused_total"],
+        'm3_profile_requests_total{profile="general"} %d' % m["profile_general_total"],
+        'm3_profile_requests_total{profile="trader"} %d' % m["profile_trader_total"],
         "# HELP m3_queue_depth pending jobs in the worker queue", "# TYPE m3_queue_depth gauge",
         "m3_queue_depth %d" % JOBQ.qsize(),
         "# HELP m3_queue_capacity hard pending-job limit", "# TYPE m3_queue_capacity gauge",
@@ -974,12 +1350,14 @@ def _metrics_text():
 
 class _Job:
     __slots__ = ("msgs", "mt", "temp", "think", "tools", "images", "lp", "ev", "result", "error",
-                 "cancelled", "priority", "stream_q")  # [auditfix] #4; +lp (#1); +priority (inc2); +stream_q (inc3)
-    def __init__(self, msgs, mt, temp, think, tools, images, lp=None, priority=1, stream_q=None):
+                 "cancelled", "priority", "stream_q", "profile")
+    def __init__(self, msgs, mt, temp, think, tools, images, lp=None, priority=1,
+                 stream_q=None, profile=None):
         self.msgs, self.mt, self.temp, self.think, self.tools, self.images = msgs, mt, temp, think, tools, images
         self.lp = lp  # logits_processors (constrained JSON) -> forces solo, threads to _run
         self.priority = priority  # [inc2] 0=urgent/trader, 1=default, 2=bench
         self.stream_q = stream_q  # [inc3] queue.Queue for SSE token streaming -> forces solo, threads to _run
+        self.profile = _normalize_lora_profile(profile)
         self.ev = threading.Event(); self.result = None; self.error = None
         self.cancelled = False  # [auditfix] #4: set when the caller times out/hangs up; worker skips/aborts the job
 
@@ -988,7 +1366,8 @@ class _GenOut:
         self.text, self.prompt_tokens, self.generation_tokens, self.finish_reason = text, pt, ct, fr
         self.logprobs = None
 
-def _enqueue(msgs, mt, temp, think, tools, images=None, lp=None, priority=1, stream_q=None):
+def _enqueue(msgs, mt, temp, think, tools, images=None, lp=None, priority=1,
+             stream_q=None, profile=None):
     """[inc2/inc3] Shed by priority, build a _Job, and put (priority, seq, job) on the PriorityQueue.
     Returns the enqueued job WITHOUT waiting (the streaming path drains stream_q itself; the blocking
     path waits on j.ev via submit_and_wait). Raises Busy when the backlog shed rejects the request.
@@ -996,7 +1375,8 @@ def _enqueue(msgs, mt, temp, think, tools, images=None, lp=None, priority=1, str
       * priority 0 (urgent/trader): may use the reserved tail, but sheds at the hard bound.
       * priority 2 (bench): sheds FIRST — threshold MAX_PENDING//2 so bench yields headroom early.
       * priority 1 (default): unchanged — sheds at MAX_PENDING."""
-    j = _Job(msgs, mt, temp, think, tools, images, lp=lp, priority=priority, stream_q=stream_q)
+    j = _Job(msgs, mt, temp, think, tools, images, lp=lp, priority=priority,
+             stream_q=stream_q, profile=profile)
     # qsize()+put must be one admission transaction. Without this lock, concurrent request threads
     # can all observe the same free slot and over-admit before any of them calls put().
     with _ADMISSION_LOCK:
@@ -1015,11 +1395,14 @@ def _enqueue(msgs, mt, temp, think, tools, images=None, lp=None, priority=1, str
             # The PriorityQueue maxsize is a second, non-bypassable hard stop.
             _QUEUE_SLOTS.release()
             raise Busy() from exc
-    _metric_add(**{"p%d_total" % priority: 1})  # [inc2] per-priority-class counter (admitted requests)
+    _metric_add(**{"p%d_total" % priority: 1,
+                   "profile_%s_total" % j.profile: 1})
     return j
 
-def submit_and_wait(msgs, mt, temp, think, tools, images=None, lp=None, priority=1):
-    j = _enqueue(msgs, mt, temp, think, tools, images=images, lp=lp, priority=priority)
+def submit_and_wait(msgs, mt, temp, think, tools, images=None, lp=None, priority=1,
+                    profile=None):
+    j = _enqueue(msgs, mt, temp, think, tools, images=images, lp=lp,
+                 priority=priority, profile=profile)
     if not j.ev.wait(timeout=LOCK_WAIT_S):
         j.cancelled = True  # [auditfix] #4: caller is giving up — worker must not (keep) generating for a dead caller
         raise Busy()
@@ -1038,7 +1421,9 @@ def _do_solo(j):
         j.ev.set(); return
     _t0 = time.time()
     try:
-        j.result = _run(j.msgs, j.mt, j.temp, j.think, j.tools, images=j.images, cancel=lambda: j.cancelled, logits_processors=j.lp, stream_q=j.stream_q)  # [auditfix] #4; #1 constrained; [inc3] stream_q
+        j.result = _run(j.msgs, j.mt, j.temp, j.think, j.tools, images=j.images,
+                        cancel=lambda: j.cancelled, logits_processors=j.lp,
+                        stream_q=j.stream_q, profile=j.profile)
         _metric_add(solo_gens_total=1, gen_count=1, gen_seconds_sum=time.time() - _t0,
                     tokens_out_total=int(getattr(j.result, "generation_tokens", 0) or 0),
                     prompt_tokens_total=int(getattr(j.result, "prompt_tokens", 0) or 0))
@@ -1048,6 +1433,9 @@ def _do_solo(j):
     finally: j.ev.set()
 
 def _do_batched(jobs, id_lists):
+    profiles = {j.profile for j in jobs}
+    if len(profiles) != 1:
+        raise RuntimeError("refusing to batch different LoRA profiles")
     tk = getattr(PROC, "tokenizer", PROC)
     mts = [j.mt for j in jobs]
     # [auditfix] #1: take GEN_LOCK around the batched forward. Previously generate_batch ran with
@@ -1057,11 +1445,12 @@ def _do_batched(jobs, id_lists):
     if not GEN_LOCK.acquire(timeout=LOCK_WAIT_S):
         raise Busy()
     try:
-        seed = random.getrandbits(31)  # [auditfix] #10: was the implicit seed=0 EVERY batch -> identical "random" outputs forever at temp>0
-        outs = generate_batch(MODEL, id_lists, mts, EOS_IDS, temp=jobs[0].temp, seed=seed,
-                              cancels=[(lambda j=j: j.cancelled) for j in jobs],  # [auditfix] #4: rows drop mid-decode when their caller dies
-                              max_gen_s=MAX_GEN_S,                                # [auditfix] #3: wall-clock cap on the batched decode loop
-                              clear_cache_steps=CLEAR_CACHE_STEPS)                # [auditfix] #2 (opt-in periodic trim)
+        with _lora_profile_scope(jobs[0].profile):
+            seed = random.getrandbits(31)  # [auditfix] #10: was the implicit seed=0 EVERY batch -> identical "random" outputs forever at temp>0
+            outs = generate_batch(MODEL, id_lists, mts, EOS_IDS, temp=jobs[0].temp, seed=seed,
+                                  cancels=[(lambda j=j: j.cancelled) for j in jobs],  # [auditfix] #4: rows drop mid-decode when their caller dies
+                                  max_gen_s=MAX_GEN_S,                                # [auditfix] #3: wall-clock cap on the batched decode loop
+                                  clear_cache_steps=CLEAR_CACHE_STEPS)                # [auditfix] #2 (opt-in periodic trim)
     finally:
         with contextlib.suppress(Exception):
             mx.clear_cache()  # [auditfix] #2: free the Metal buffer cache after every batched gen
@@ -1080,13 +1469,32 @@ def _do_batched(jobs, id_lists):
         else:
             j.result = res; j.ev.set()
 
+def _request_fatal_shutdown(reason):
+    global _FATAL_LIFECYCLE, READY
+    if _FATAL_LIFECYCLE is None:
+        _FATAL_LIFECYCLE = reason
+    READY = False
+    _FATAL_EVENT.set()
+    # Python delivers this to main, whose already-installed handler raises a
+    # lifecycle exception and runs listener/lease cleanup. Killing self cannot
+    # fail under normal POSIX semantics; a failure is still logged fail-closed.
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except OSError:
+        try:
+            _log_exc("fatal worker could not signal main; event fallback armed")
+        except BaseException:
+            pass
+
+
 def _batch_worker():
     while True:
-        first = JOBQ.get()[2]   # [inc2] PriorityQueue yields (priority, seq, job); unwrap the job
-        _QUEUE_SLOTS.release()  # first is active now, not pending
-        jobs = [first]
-        p0 = first.priority
-        try:  # [auditfix] #16: see except at the bottom — a worker escape must not be a silent brownout
+        jobs = []
+        try:  # Any worker escape requests main-thread lifecycle cleanup.
+            first = JOBQ.get()[2]  # PriorityQueue yields (priority, seq, job).
+            _QUEUE_SLOTS.release()  # first is active now, not pending
+            jobs = [first]
+            p0 = first.priority
             # [inc2] priority-0 (urgent/trader) SKIPS the 150ms coalescing window and runs immediately
             # with whatever is already in hand (a batch of 1). For any other class the window gathers
             # ONLY jobs of the SAME priority as the first job: a job pulled from the queue whose class
@@ -1099,7 +1507,8 @@ def _batch_worker():
                     if rem <= 0: break
                     try: nitem = JOBQ.get(timeout=rem)
                     except _queue.Empty: break
-                    if nitem[2].priority != p0:
+                    if nitem[2].priority != p0 \
+                            or nitem[2].profile != first.profile:
                         # Keep its admission slot held across this get/requeue so a request thread
                         # cannot fill the queue and deadlock the sole worker on a blocking put.
                         JOBQ.put_nowait(nitem)
@@ -1132,7 +1541,7 @@ def _batch_worker():
             if len(short) == 1:
                 _do_solo(short[0])
             elif len(short) > 1:
-                if len({round(j.temp, 4) for j in short}) == 1:
+                if len({j.temp for j in short}) == 1:
                     try: _do_batched(short, short_ids)
                     except Exception as e:
                         _log_exc("_do_batched")  # [auditfix] #5: batch failures now hit err.log
@@ -1140,17 +1549,19 @@ def _batch_worker():
                 else:
                     for j in short: _do_solo(j)
         except BaseException:
-            # [auditfix] #16: worker death used to be a SILENT BROWNOUT — the thread died, /health
-            # kept reporting ready:true, and every POST queued until its 600s timeout. Mirror the
-            # GLM H4 approach: log, fail the in-hand jobs, and hard-exit non-zero so launchd
-            # KeepAlive relaunches a healthy process.
-            _log_exc("_batch_worker FATAL — exiting for KeepAlive relaunch")
+            # Publish fatal state before fallible diagnostics/job cleanup. Main
+            # polls the event as a fallback even if self-signal or logging fails.
+            _request_fatal_shutdown("batch worker failed")
+            try:
+                _log_exc("_batch_worker FATAL — requesting clean KeepAlive relaunch")
+            except BaseException:
+                pass
             err = RuntimeError("batch worker died; server restarting")
             for j in jobs:
                 with contextlib.suppress(Exception):
                     if not j.ev.is_set():
                         j.error = err; j.ev.set()
-            os._exit(1)
+            return
 # ===== END BATCHING WORKER =============================================================
 
 
@@ -1209,9 +1620,8 @@ def _read_json_request(headers, rfile, max_bytes=None):
 PRIORITY_TOKEN_FILE = os.environ.get("M3_PRIORITY_TOKEN_FILE", "")
 
 
-def _load_priority_token(path=None):
+def _load_owner_token(token_path):
     """Read a token only from a regular, owner-owned file inaccessible to group/other users."""
-    token_path = PRIORITY_TOKEN_FILE if path is None else path
     if not token_path:
         return None
     fd = None
@@ -1232,6 +1642,11 @@ def _load_priority_token(path=None):
             os.close(fd)
 
 
+def _load_priority_token(path=None):
+    token_path = PRIORITY_TOKEN_FILE if path is None else path
+    return _load_owner_token(token_path)
+
+
 def _request_priority(headers):
     """Honor bench/yield priority 2 freely; require the owner-file credential for urgent 0."""
     try:
@@ -1247,6 +1662,30 @@ def _request_priority(headers):
     if expected and isinstance(supplied, str) and hmac.compare_digest(supplied, expected):
         return requested
     return 1
+
+
+def _request_lora_profile(headers):
+    """Select the fail-safe default or authenticate one explicit fixed profile."""
+    def unique(name):
+        values = (headers.get_all(name, []) if hasattr(headers, "get_all")
+                  else ([headers.get(name)] if headers.get(name) is not None else []))
+        if len(values) > 1:
+            raise ProfileAuthorizationError("duplicate profile control header")
+        return values[0] if values else None
+
+    supplied_profile = unique("X-M3-LoRA-Profile")
+    supplied_token = unique("X-M3-LoRA-Profile-Token") or ""
+    if supplied_profile is None:
+        if supplied_token:
+            raise ProfileAuthorizationError("profile token supplied without a profile")
+        return LORA_DEFAULT_PROFILE
+    if not LORA_PROFILES_ENABLED or supplied_profile not in _FIXED_LORA_PROFILES:
+        raise ProfileAuthorizationError("unknown or unavailable LoRA profile")
+    expected = _load_owner_token(LORA_PROFILE_TOKEN_FILE)
+    if not expected or not isinstance(supplied_token, str) \
+            or not hmac.compare_digest(supplied_token, expected):
+        raise ProfileAuthorizationError("LoRA profile authorization failed")
+    return supplied_profile
 
 
 def _validate_openai_fields(req):
@@ -1293,13 +1732,17 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         # GET endpoints never touch the model -> always answerable, even mid-load. /v1/models and
         # /health are the watchdog's "is the server process alive" liveness checks.
-        if self.path.startswith("/metrics"):   # #5: Prometheus text exposition
+        route = self.path.partition("?")[0]
+        if route == "/metrics":   # #5: Prometheus text exposition
             self._send(200, _metrics_text(), ctype="text/plain; version=0.0.4")
-        elif self.path.startswith("/v1/models") or self.path.startswith("/health"):
+        elif route in ("/v1/models", "/health"):
             body = json.dumps(_health_payload()).encode()
             self._send(200, body)
-        else:
+        elif route == "/":
             self._send(200, b"ready" if READY else b"loading", ctype="text/plain")
+        else:
+            self._send(404, json.dumps({"error": {"message": "route not found",
+                                                   "type": "not_found_error"}}).encode())
 
     def do_POST(self):
         route = self.path.partition("?")[0]
@@ -1323,9 +1766,16 @@ class H(BaseHTTPRequestHandler):
             return
         prio = _request_priority(self.headers)
         try:
+            if "m3_profile" in req or "lora_profile" in req:
+                raise ValueError("LoRA profiles are header-gated")
+            profile = _request_lora_profile(self.headers)
             if route == "/v1/chat/completions":
-                return self._openai(req, prio)
-            return self._legacy(req, prio)
+                return self._openai(req, prio, profile)
+            return self._legacy(req, prio, profile)
+        except ProfileAuthorizationError:
+            self._send(403, json.dumps({"error": {
+                "message": "profile authorization failed",
+                "type": "authentication_error"}}).encode())
         except StructuredDecodingUnavailable:
             self._send(503, json.dumps({"error": {"message": "structured decoding unavailable",
                                                    "type": "service_unavailable"}}).encode())
@@ -1338,7 +1788,8 @@ class H(BaseHTTPRequestHandler):
                                                    "type": "server_error"}}).encode())
 
     # ---- OpenAI-compatible chat completions (PROD) ----
-    def _openai(self, req, prio=1):
+    def _openai(self, req, prio=1, profile=None):
+        profile = _normalize_lora_profile(profile)
         msgs, mt, temp = _validate_openai_fields(req)
         think = "disabled"  # prod default
         # honor a leading "think:" on the last user message (preserves the Slack-Alfred prefix UX)
@@ -1372,9 +1823,11 @@ class H(BaseHTTPRequestHandler):
         # decode (forces the job solo). Tool-call requests keep the whole-completion protocol-parity SSE
         # path below (partial tool calls are not streamed). _stream_tokens owns the tmp_paths cleanup.
         if req.get("stream") and not tools:
-            return self._stream_tokens(req, msgs, mt, temp, think, image_paths, tmp_paths, lp, prio)
+            return self._stream_tokens(req, msgs, mt, temp, think, image_paths,
+                                       tmp_paths, lp, prio, profile)
         try:
-            out = submit_and_wait(msgs, mt, temp, think, tools, images=image_paths, lp=lp, priority=prio)
+            out = submit_and_wait(msgs, mt, temp, think, tools, images=image_paths,
+                                  lp=lp, priority=prio, profile=profile)
         except Busy:
             _metric_add(busy_503_total=1)  # #5
             err = json.dumps({"error": {"message": "model busy", "type": "overloaded"}}).encode()
@@ -1403,7 +1856,7 @@ class H(BaseHTTPRequestHandler):
             msg["tool_calls"] = tcalls
             fr = "tool_calls"
         if req.get("stream"):  # [auditfix] #9: stream:true was advertised but silently ignored
-            return self._send_sse_completion(req, msg, fr, pt, ct)
+            return self._send_sse_completion(req, msg, fr, pt, ct, profile)
         _choice = {"index": 0, "message": msg, "finish_reason": fr}
         if req.get("logprobs"):
             try:
@@ -1429,6 +1882,8 @@ class H(BaseHTTPRequestHandler):
                 _choice["logprobs"] = {"error": "logprobs unavailable"}
         resp = {"id": "chatcmpl-m3", "object": "chat.completion", "created": int(time.time()),
                 "model": req.get("model") or MODEL_ID,
+                "m3_profile": profile,
+                "m3_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256,
                 "choices": [_choice],
                 "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
         body = json.dumps(resp).encode()
@@ -1436,7 +1891,8 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         with contextlib.suppress(Exception): self.wfile.write(body)
 
-    def _send_sse_completion(self, req, msg, fr, pt, ct):
+    def _send_sse_completion(self, req, msg, fr, pt, ct, profile=None):
+        profile = _normalize_lora_profile(profile)
         # [auditfix] #9: minimal OpenAI SSE. `stream:true` was advertised in the module docstring
         # but silently ignored — SSE clients waiting on an event stream got one plain JSON body.
         # The batched worker returns WHOLE completions, so this emits the finished result as a
@@ -1444,7 +1900,8 @@ class H(BaseHTTPRequestHandler):
         # parity, NOT incremental-latency streaming. True token streaming is deferred to the
         # mlx_lm.server continuous-batching cutover (see SERVING_FIXES_README).
         base = {"id": "chatcmpl-m3", "object": "chat.completion.chunk", "created": int(time.time()),
-                "model": req.get("model") or MODEL_ID}
+                "model": req.get("model") or MODEL_ID, "m3_profile": profile,
+                "m3_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256}
         d1 = {"role": "assistant"}
         if msg.get("content") is not None:
             d1["content"] = msg["content"]
@@ -1460,7 +1917,9 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: " + json.dumps(c).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
 
-    def _stream_tokens(self, req, msgs, mt, temp, think, image_paths, tmp_paths, lp, prio):
+    def _stream_tokens(self, req, msgs, mt, temp, think, image_paths, tmp_paths, lp,
+                       prio, profile=None):
+        profile = _normalize_lora_profile(profile)
         # [inc3] TRUE token streaming on the solo path. Enqueue a SOLO job carrying a stream_q, then
         # drain that queue and write spec-shaped OpenAI chat.completion.chunk SSE deltas as tokens land
         # (vs _send_sse_completion, which replays a finished completion for the batched/tool cases).
@@ -1474,7 +1933,8 @@ class H(BaseHTTPRequestHandler):
         # on any write sets j.cancelled (the decode loop aborts within 16 chunks) and stops the drain.
         sq = _queue.Queue()
         try:
-            j = _enqueue(msgs, mt, temp, think, None, images=image_paths, lp=lp, priority=prio, stream_q=sq)
+            j = _enqueue(msgs, mt, temp, think, None, images=image_paths, lp=lp,
+                         priority=prio, stream_q=sq, profile=profile)
         except Busy:
             _metric_add(busy_503_total=1)
             for tp in tmp_paths:
@@ -1485,7 +1945,8 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("Retry-After", "2"); self.end_headers(); self.wfile.write(err)
             return
         base = {"id": "chatcmpl-m3", "object": "chat.completion.chunk", "created": int(time.time()),
-                "model": req.get("model") or MODEL_ID}
+                "model": req.get("model") or MODEL_ID, "m3_profile": profile,
+                "m3_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256}
         state = {"role_sent": False, "broken": False}
         def _emit(text):
             if not text or state["broken"]:
@@ -1568,7 +2029,8 @@ class H(BaseHTTPRequestHandler):
                 with contextlib.suppress(Exception): os.unlink(tp)
 
     # ---- legacy test format (nightly eval harness) ----
-    def _legacy(self, req, prio=1):
+    def _legacy(self, req, prio=1, profile=None):
+        profile = _normalize_lora_profile(profile)
         q = req.get("prompt", ""); mt = int(req.get("max_tokens", 256))
         temp = float(req.get("temp", 0.0)); think = req.get("thinking", "disabled")
         if isinstance(q, str) and q.lower().startswith("think:"):
@@ -1579,7 +2041,8 @@ class H(BaseHTTPRequestHandler):
             # ran generate_batch WITHOUT GEN_LOCK -> a POST / during a batched decode = two
             # simultaneous MLX generations on one Metal queue. Route through the worker queue like
             # _openai (the file's model; matches glm_serve_batched). Also lets legacy calls batch.
-            out = submit_and_wait(q, mt, temp, think, tools, priority=prio)
+            out = submit_and_wait(q, mt, temp, think, tools, priority=prio,
+                                  profile=profile)
         except Busy:
             self.send_response(503); self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1600,7 +2063,9 @@ class H(BaseHTTPRequestHandler):
                   "prompt_tokens": getattr(out, "prompt_tokens", None),
                   "prompt_tps": getattr(out, "prompt_tps", None),
                   "tps": getattr(out, "generation_tps", None),
-                  "finish": getattr(out, "finish_reason", None)}
+                  "finish": getattr(out, "finish_reason", None),
+                  "m3_profile": profile,
+                  "m3_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256}
         if save_to:
             ok, public_error = _save_text_create_only(save_to, text)
             if not ok:
@@ -1654,6 +2119,11 @@ def _prepare_runtime_identity():
     if _ARTIFACT_MANIFEST is None:
         raise StartupIdentityError(
             "M3_ARTIFACT_MANIFEST is required before readiness can be established")
+    if LORA_PROFILES_ENABLED:
+        if _load_owner_token(LORA_PROFILE_TOKEN_FILE) is None:
+            raise StartupIdentityError(
+                "M3_LORA_PROFILE_TOKEN_FILE must contain an owner-only token")
+        _verify_lora_adapter_binding()
     _RUNTIME_RECEIPT_OUT = _runtime_receipt_output()
 
 
@@ -1766,6 +2236,18 @@ def _initialize_runtime_identity(readiness_smoke=None):
         "clear_cache_steps": CLEAR_CACHE_STEPS,
         "max_tokens": M3_MAX_TOKENS,
         "max_temperature": M3_MAX_TEMPERATURE,
+        "lora_profiles_enabled": LORA_PROFILES_ENABLED,
+        "lora_default_profile": LORA_DEFAULT_PROFILE,
+        "lora_profiles": (dict(_FIXED_LORA_PROFILES)
+                          if LORA_PROFILES_ENABLED else {}),
+        "lora_profile_config_sha256": LORA_PROFILE_CONFIG_SHA256,
+        "lora_adapter_realpath": LORA_ADAPTER_DIR,
+        "lora_adapter_config_sha256": SERVER_IDENTITY.get(
+            "lora_adapter_config_sha256"),
+        "lora_adapter_weights_sha256": SERVER_IDENTITY.get(
+            "lora_adapter_weights_sha256"),
+        "lora_adapter_weights_bytes": SERVER_IDENTITY.get(
+            "lora_adapter_weights_bytes"),
         "readiness_smoke_sha256": smoke_sha,
     }
     contract_bytes = (json.dumps(contract, sort_keys=True, separators=(",", ":"),
@@ -1866,6 +2348,11 @@ def _run_readiness_smoke():
     if not streamed_text.strip() or streamed_text != (getattr(streamed, "text", "") or ""):
         raise StartupIdentityError("stream readiness smoke output/event mismatch")
     tests.append(_smoke_result("true-stream", stream_prompt, streamed))
+    if LORA_PROFILES_ENABLED:
+        trader_prompt = "Reply with exactly: PROFILE_READY"
+        trader = _run([{"role": "user", "content": trader_prompt}], 12, 0.0,
+                      "disabled", None, profile="trader")
+        tests.append(_smoke_result("lora-trader-profile", trader_prompt, trader))
     return {"schema": "m3-readiness-smoke.v1", "startup_nonce": SERVER_IDENTITY["startup_nonce"],
             "artifact_id": SERVER_IDENTITY["artifact_id"], "tests": tests,
             "created_unix": int(time.time())}
@@ -1877,11 +2364,17 @@ def _load():
     global MODEL, PROC, CFG, READY
     print("loading M3 8-bit...", flush=True)
     try:
-        MODEL, PROC = load(MD); CFG = load_config(MD)
-    except BaseException as e:  # incl. MemoryError / interpreter-level failures
+        load_kwargs = {"trust_remote_code": True}
+        if LORA_PROFILES_ENABLED:
+            load_kwargs["adapter_path"] = LORA_ADAPTER_DIR
+        MODEL, PROC = load(MD, **load_kwargs)
+        CFG = load_config(MD, trust_remote_code=True)
+    except Exception as e:  # includes MemoryError; signals use _ServingSignal
         print("FATAL load failed:", e, flush=True)
-        _log_exc("_load")  # [auditfix] #5: full traceback to err.log before the hard exit
-        os._exit(1)  # non-zero -> KeepAlive relaunch, not a silent wedge
+        _log_exc("_load")
+        raise StartupIdentityError("model load failed") from e
+    _reprove_lora_adapter_stability()
+    _initialize_lora_layers(MODEL)
     EOS_IDS.clear()
     _eos = getattr(CFG, "eos_token_id", None)
     if _eos is None and isinstance(CFG, dict): _eos = CFG.get("eos_token_id")
@@ -1899,6 +2392,8 @@ def _load():
         raise StartupIdentityError("readiness smoke failed") from _we
     threading.Thread(target=_batch_worker, daemon=True).start()
     _initialize_runtime_identity(readiness_smoke)
+    if _FATAL_EVENT.is_set():
+        raise StartupIdentityError("batch worker failed during startup")
     READY = True   # flip READY only after smoke + worker + create-only runtime receipt
     print("batching worker: max=%d window=%dms eos=%s" % (BATCH_MAX, BATCH_WINDOW_MS, sorted(EOS_IDS)), flush=True)
     print("LOADED — serving 127.0.0.1:%d" % PORT, flush=True)
@@ -1908,26 +2403,80 @@ def main():
     """Bind the localhost server and load the model. Imports/tests never execute this path."""
     if _RUNTIME_IMPORT_ERROR is not None or generate_batch is None:
         raise RuntimeError("M3 serving runtime dependencies are unavailable") from _RUNTIME_IMPORT_ERROR
-    lease_path = _acquire_machine_resource()
+    global _MACHINE_RESOURCE_PATH, _FATAL_LIFECYCLE
+    _FATAL_LIFECYCLE = None
+    _FATAL_EVENT.clear()
+    lease_path = None
     httpd = None
+    serve_thread = None
     stop = threading.Event()
+    result = 0
+    stop_requested = False
+
+    def handle_stop(signum, _frame):
+        nonlocal stop_requested
+        if stop_requested:
+            return
+        stop_requested = True
+        if _FATAL_LIFECYCLE is not None:
+            raise _ServingFatal(_FATAL_LIFECYCLE)
+        raise _ServingSignal(signum)
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, handle_stop)
     try:
+        lease_path = _acquire_machine_resource()
         _prepare_runtime_identity()
         # Bind + start serving FIRST (port LISTENs in ms), THEN load weights on the main thread.
         ThreadingHTTPServer.allow_reuse_address = True
         httpd = ThreadingHTTPServer(("127.0.0.1", PORT), H)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # A bounded request loop avoids BaseServer.shutdown()'s documented
+        # deadlock when a signal lands after construction but before
+        # serve_forever() has entered its loop.
+        httpd.timeout = 0.25
+
+        def serve_until_stopped():
+            while not stop.is_set():
+                httpd.handle_request()
+
+        serve_thread = threading.Thread(
+            target=serve_until_stopped, daemon=True)
+        serve_thread.start()
         print("LISTENING 127.0.0.1:%d (loading weights, serving 503 until ready)" % PORT, flush=True)
         _load()
-        signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
-        signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
-        stop.wait()
+        while not stop.wait(0.10):
+            if _FATAL_EVENT.is_set():
+                raise _ServingFatal(_FATAL_LIFECYCLE or "fatal serving worker")
+    except _ServingSignal as stopped:
+        result = 128 + stopped.signum
+    except _ServingFatal:
+        result = 1
+    except BaseException as exc:
+        print("FATAL server lifecycle failed: %s" % exc, flush=True)
+        _log_exc("main")
+        result = 1
     finally:
+        # From this point every later/mixed stop signal is a no-op until all
+        # three dispositions are installed. It cannot interrupt lease cleanup.
+        stop_requested = True
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_IGN)
+        stop.set()
+        if serve_thread is not None:
+            with contextlib.suppress(Exception):
+                if serve_thread.is_alive():
+                    serve_thread.join(timeout=1.0)
         if httpd is not None:
-            with contextlib.suppress(Exception): httpd.shutdown()
             with contextlib.suppress(Exception): httpd.server_close()
-        _release_machine_resource(lease_path)
+        release_path = lease_path or _MACHINE_RESOURCE_PATH
+        if release_path is not None and _MACHINE_RESOURCE_TOKEN is not None:
+            try:
+                _release_machine_resource(release_path)
+            except BaseException:
+                _log_exc("_release_machine_resource")
+                result = 125
+    return result
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

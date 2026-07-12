@@ -31,4 +31,4 @@ jobs:
           python -m compileall -q scripts tests
           find scripts -type f -name '*.sh' -exec bash -n {} +
       - name: Backup and status-API contracts
-        run: python -m unittest -v tests/test_infra_security.py
+        run: python tests/test_infra_security.py -v

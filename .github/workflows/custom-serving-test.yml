@@ -24,4 +24,4 @@ jobs:
           python-version: "3.12"
       - name: Run dependency-free request/security suite
         working-directory: services/m3-custom-serving
-        run: python -m unittest -v tests/test_m3_serve_batched_security.py
+        run: python -m unittest discover -v -s tests -p 'test_*.py'

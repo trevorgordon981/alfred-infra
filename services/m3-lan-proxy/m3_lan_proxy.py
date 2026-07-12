@@ -10,7 +10,8 @@ The live proxy's useful contract is intentionally small:
 
 POST authentication terminates here.  The proxy credential is never forwarded
 to M3, and arbitrary caller headers (including queue/priority controls) are not
-trusted or relayed.
+trusted or relayed. The fixed LoRA profile name and its separate profile token
+are the only additional end-to-end controls on the positive allowlist.
 """
 
 from __future__ import annotations
@@ -83,7 +84,15 @@ CALLER_PRIORITY_HEADERS = frozenset(
     }
 )
 
-FORWARDED_REQUEST_HEADERS = ("Content-Type", "Accept")
+FORWARDED_REQUEST_HEADERS = (
+    "Content-Type",
+    "Accept",
+    "X-M3-LoRA-Profile",
+    "X-M3-LoRA-Profile-Token",
+)
+LORA_PROFILE_HEADERS = frozenset(
+    {"x-m3-lora-profile", "x-m3-lora-profile-token"}
+)
 TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/=-]{16,4096}\Z")
 CONTENT_LENGTH_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
@@ -725,13 +734,27 @@ class M3LanProxyHandler(BaseHTTPRequestHandler):
         forwarded: dict[str, str] = {}
         for name in FORWARDED_REQUEST_HEADERS:
             lowered = name.lower()
-            if lowered in STATIC_HOP_BY_HOP_HEADERS or lowered in nominated:
+            if lowered in STATIC_HOP_BY_HOP_HEADERS:
                 continue
             values = self.headers.get_all(name, [])
             if not values:
                 continue
+            if lowered in nominated:
+                # Silently dropping a requested profile could run general=0
+                # when the caller intended trader=1. Reject that ambiguity.
+                if lowered in LORA_PROFILE_HEADERS:
+                    self._send_json_error(
+                        HTTPStatus.BAD_REQUEST, "invalid profile control header"
+                    )
+                    return None
+                continue
             if lowered == "content-type" and len(values) != 1:
                 self._send_json_error(HTTPStatus.BAD_REQUEST, "invalid Content-Type header")
+                return None
+            if lowered in LORA_PROFILE_HEADERS and len(values) != 1:
+                self._send_json_error(
+                    HTTPStatus.BAD_REQUEST, "invalid profile control header"
+                )
                 return None
             forwarded[name] = ", ".join(values)
         return forwarded
@@ -739,7 +762,7 @@ class M3LanProxyHandler(BaseHTTPRequestHandler):
     def _open_upstream(self, method: str, target: str, body: bytes | None) -> None:
         # Positive allowlist.  Authorization authenticates to this proxy and is
         # deliberately not sent to M3.  Priority and hop-by-hop caller headers
-        # are likewise absent.
+        # are likewise absent. Only the fixed-profile pair crosses this boundary.
         headers = self._forwarded_request_headers()
         if headers is None:
             return

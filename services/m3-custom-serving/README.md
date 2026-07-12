@@ -94,6 +94,37 @@ Important environment controls:
 | `M3_MACHINE_RESOURCE_LOCK` | `~/.local/state/alfred-machine-resource.lock` | Shared train/build/eval/serve lease |
 | `M3_ALLOW_SAVE_TO` | `0` | Enable confined create-only saves |
 | `M3_SAVE_DIR` | `~/m3_saves` | Confined save root |
+| `M3_LORA_PROFILES` | `0` | Enable the receipt-bound experimental `general=0` / `trader=1` adapter profiles |
+| `M3_LORA_ADAPTER_DIR` | unset | Canonical unfused adapter directory used only when profile mode is enabled |
+| `M3_LORA_PROFILE_CONFIG` | unset | Canonical receipt binding the exact adapter and fixed profiles |
+| `M3_LORA_PROFILE_TOKEN_FILE` | unset | Owner-only token required for every explicit profile request |
+
+## Receipt-bound adapter profiles
+
+Profile mode is an opt-in evaluation and rollback facility; it is not the
+default production architecture. `M3_LORA_PROFILES=0` preserves the existing
+fused model behavior exactly. When enabled, the server accepts only two fixed
+strengths: `general=0` and `trader=1`. Arbitrary strengths, body-selected
+profiles, unknown names, and multiple adapters fail closed.
+
+Every explicit profile request requires both `X-M3-LoRA-Profile` and
+`X-M3-LoRA-Profile-Token`. The separate LAN proxy forwards only this exact
+pair in addition to its existing request-header allowlist; it never forwards
+the proxy bearer credential. Missing, duplicated, connection-nominated, or
+incorrect profile controls are rejected before work reaches the model queue.
+
+The profile receipt binds the adapter directory, `adapter_config.json`,
+`adapters.safetensors`, their SHA-256 digests and sizes, the `general` default,
+and exactly `{"general":0.0,"trader":1.0}`. Startup rechecks those files
+before and after model load and loads the adapter with explicit
+`trust_remote_code=True`. Profile scale changes are serialized under the
+generation lock, MLX is synchronized before restoring `general=0`, batches
+never mix profiles, and automatic-prefix-cache tenants include the profile
+receipt and strength.
+
+Do not enable this mode merely because an adapter has lower training loss. A
+candidate still needs the same frozen general-reasoning, coding, safety,
+tool-use, portfolio, latency, and memory gates required for a fused promotion.
 
 ## Verification
 
@@ -103,7 +134,7 @@ priority authentication, save confinement, error redaction, streaming failure
 ordering, and structured-output fail-closed behavior:
 
 ```bash
-python -m unittest -v tests/test_m3_serve_batched_security.py
+python -m unittest discover -v -s tests -p 'test_*.py'
 ```
 
 A production deployment still requires supervised real-model validation. The

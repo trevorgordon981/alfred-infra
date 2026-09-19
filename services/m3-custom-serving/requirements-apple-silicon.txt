@@ -1,5 +1,10 @@
 mlx==0.31.2
-numpy==1.26.4
+# The pinned mlx-vlm revision requires opencv-python>=4.12, whose macOS
+# wheels require NumPy 2.x and cap it below 2.3.
+numpy==2.2.6
 safetensors==0.7.0
-transformers==5.5.0
+transformers==5.10.4
+# MiniMax-M3's image processor imports torchvision at module load; the fork
+# does not currently declare it. This also selects its matching torch build.
+torchvision==0.29.0
 mlx-vlm @ git+https://github.com/trevorgordon981/mlx-vlm.git@d9f1700ad2cb5775c218601eba613ad1d32ba09e

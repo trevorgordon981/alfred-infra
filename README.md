@@ -60,6 +60,10 @@ export SPARK_B_HOST="user@100.x.y.z"       # Spark B — Voice node
 export STUDIO_IP="100.x.y.z"
 export SPARK_A_IP="100.x.y.z"
 export SPARK_B_IP="100.x.y.z"
+
+# k3s disaster-recovery backup (scripts/k3s-backup.sh)
+export K3S_BACKUP_SPARK="user@100.x.y.z"   # k3s node holding the cluster DB
+export K3S_BACKUP_NAS="user@nas.your-tailnet.ts.net"
 ```
 
 The `prometheus-scrape-config.yml` file uses `<SPARK_A_IP>` / `<SPARK_B_IP>`

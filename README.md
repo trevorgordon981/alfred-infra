@@ -43,7 +43,21 @@ Adapt the role labels (`rag`, `voice`) to whatever workloads your GPU nodes run.
 | `prometheus-scrape-config.yml` | Snippet to add to your `prometheus.yml` for new scrape targets. |
 | `alfred-infrastructure-dashboard.json` | Grafana dashboard: CPU, memory, disk, network, GPU temp/util/memory/power, uptime, status. |
 | `context-bench.py` | Context-window benchmark for mlx-vlm (TTFT, throughput, page-out pressure across 4K–128K). |
-| `context-bench-results.json` | Sample benchmark output for reference. |
+| `context-bench-results.json` | Sample benchmark output for reference. The TTFT and pageout columns are real; see the caveat below before citing `avg_tps`. |
+
+### Caveat on `context-bench-results.json`
+
+The `avg_tps` figures in that file are a measurement artifact, not throughput.
+`avg_total_s` minus `avg_ttft_s` is 0.02s on every row, which means the serving
+endpoint returned each completion in a single buffered frame rather than
+streaming it. `tokens_per_sec` is `output_tokens / (end - first_token)`, so a
+near-zero denominator produced rates around 11,000 tok/s, which no Mac Studio
+achieves. The TTFT ramp (18.6s at 4K to 170.9s at 96K) and the pageout counts
+are measured correctly and are the useful part of the file.
+
+context-bench now refuses to report a rate in this situation instead of printing
+one. Re-run the sweep against a streaming endpoint to get real throughput
+numbers.
 
 ## Configure before use
 

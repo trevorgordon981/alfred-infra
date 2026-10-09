@@ -15,6 +15,18 @@ It assumes a common small-cluster topology:
 
 Adapt the role labels (`rag`, `voice`) to whatever workloads your GPU nodes run.
 
+## Dashboard
+
+![Grafana dashboard: CPU, memory, disk, network, and GPU temperature, utilisation, memory, and power across the Mac Studio and both Spark nodes](docs/img/grafana-dashboard.png)
+
+<!-- TODO(trevor): save the screenshot to docs/img/grafana-dashboard.png
+     (exact path, lowercase, .png). Grafana -> the imported
+     "alfred-infrastructure" dashboard -> set the range to 24h so the GPU and
+     network panels have a visible trend -> Share -> Export -> Save as image,
+     or just a full-window screenshot. Crop to the panel grid, drop the browser
+     chrome, and keep it under about 1600px wide. Until the file exists this
+     renders as broken alt text. -->
+
 ## Files
 
 | File | Purpose |
@@ -124,10 +136,9 @@ those variants would be appreciated.
 
 Part of a self-hosted LLM operations toolkit:
 
-- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — tool-call-translating proxy for local LLM serving (monitored by this kit)
-- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — OTel metrics proxy whose Prometheus output this kit's dashboards visualize
-- [context-bench](https://github.com/trevorgordon981/context-bench) — context-window benchmark used from this kit to characterize new model deployments
-- [alfred-rag](https://github.com/trevorgordon981/alfred-rag) — hybrid RAG stack (example workload running on this infrastructure)
+- [gordon-gateway](https://github.com/trevorgordon981/gordon-gateway) - LLM gateway for local serving: routing, tool-call translation, and OTLP tracing (monitored by this kit)
+- [context-bench](https://github.com/trevorgordon981/context-bench) - context-window benchmark used from this kit to characterize new model deployments
+- [alfred-rag](https://github.com/trevorgordon981/alfred-rag) - hybrid RAG stack (example workload running on this infrastructure)
 
 ## License
 
